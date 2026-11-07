@@ -119,6 +119,16 @@ pub trait Driver {
     fn read_flash(&mut self, offset: u32, data: &mut [u8]);
     fn write_flash(&mut self, offset: u32, data: &[u8]);
     fn prepare_settings_storage(&mut self, _wire_size: usize, _validate: fn(&[u8]) -> bool) {}
+    /// General-purpose persistent storage (sequencer projects). Size 0 = not available on this device.
+    fn user_storage_size(&mut self) -> u32 {
+        0
+    }
+    fn read_user_storage(&mut self, _offset: u32, _data: &mut [u8]) -> bool {
+        false
+    }
+    fn write_user_storage(&mut self, _offset: u32, _data: &[u8]) -> bool {
+        false
+    }
     fn device_id(&self) -> u8;
     fn highspeed_leds_enabled(&self) -> bool {
         false
@@ -230,6 +240,18 @@ pub fn write_flash(offset: u32, data: &[u8]) {
 
 pub fn prepare_settings_storage(wire_size: usize, validate: fn(&[u8]) -> bool) {
     let _ = with(|driver| driver.prepare_settings_storage(wire_size, validate));
+}
+
+pub fn user_storage_size() -> u32 {
+    with(|driver| driver.user_storage_size()).unwrap_or(0)
+}
+
+pub fn read_user_storage(offset: u32, data: &mut [u8]) -> bool {
+    with(|driver| driver.read_user_storage(offset, data)).unwrap_or(false)
+}
+
+pub fn write_user_storage(offset: u32, data: &[u8]) -> bool {
+    with(|driver| driver.write_user_storage(offset, data)).unwrap_or(false)
 }
 
 pub fn device_id() -> u8 {

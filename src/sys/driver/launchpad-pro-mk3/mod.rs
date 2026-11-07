@@ -6,6 +6,7 @@
 use crate::sys::driver::common::storage::ExtFlash;
 
 mod input_filter;
+mod din;
 pub mod led;
 mod map;
 mod runtime;
@@ -125,6 +126,7 @@ async fn main(_spawner: Spawner) {
 
     usb::init_event_queues();
     usb::init();
+    din::init();
 
     let app_host = AppHost::new(AppId::Boot);
     let app_host = APP_HOST.init(embassy_sync::mutex::Mutex::new(app_host));
@@ -143,6 +145,14 @@ async fn main(_spawner: Spawner) {
             while let Some(event) = usb::dequeue_midi_event() {
                 app_host_guard.route_midi_event(event);
             }
+        }
+
+        if din::has_input() {
+            let mut app_host_guard = app_host.lock().await;
+            din::poll(|input| match input {
+                din::DinInput::Event(event) => app_host_guard.route_midi_event(event),
+                din::DinInput::Sysex(data) => app_host_guard.receive_sysex(crate::sys::midi::MidiPort::Din, data),
+            });
         }
 
         runtime_driver.leds_task();

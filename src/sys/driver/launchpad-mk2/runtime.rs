@@ -45,7 +45,7 @@ impl Driver for RuntimeDriver {
 
     fn send_midi(&mut self, port: MidiPort, data: &[u8]) {
         match port {
-            MidiPort::Din => {}
+            MidiPort::Din | MidiPort::Din2 => {}
             MidiPort::Daw | MidiPort::Midi => {
                 let _ = usb::enqueue_tx_message(port.as_cable(), data);
             }

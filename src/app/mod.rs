@@ -9,6 +9,9 @@ pub mod host;
 pub mod palette_editor;
 pub mod performance;
 pub mod programmer;
+/// 8-track step sequencer: Launchpad Pro MK3 only (needs its DIN outputs, flash and RAM).
+#[cfg(feature = "launchpad-pro-mk3")]
+pub mod sequencer;
 pub mod setup;
 
 pub use crate::sys::midi::MidiPort;
@@ -25,4 +28,5 @@ pub enum AppId {
     Programmer,
     Daw,
     PaletteEditor,
+    Sequencer,
 }

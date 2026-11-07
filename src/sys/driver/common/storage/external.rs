@@ -24,6 +24,13 @@ use spi_memory::series25::Flash;
 use spi_memory::{BlockDevice, Read};
 
 pub const PAGE_SIZE: usize = 256;
+
+/// User data area on the Pro MK3's 16 MB flash: 1 MB at 15 MB, far below the settings window at the top.
+/// (The stock firmware's own project storage layout is not known; reflashing stock may need a factory reset.)
+#[cfg(feature = "launchpad-pro-mk3")]
+pub const USER_OFFSET: u32 = 0x00f0_0000;
+#[cfg(feature = "launchpad-pro-mk3")]
+pub const USER_SIZE: u32 = 0x0010_0000;
 pub const SECTOR_SIZE: usize = 4096;
 
 #[cfg(feature = "launchpad-pro-mk3")]
@@ -167,6 +174,54 @@ impl<'d> ExtFlash<'d> {
         };
         this.probe();
         this
+    }
+
+    /// Reads from the user data area (projects etc.), which lies outside the settings window.
+    #[cfg(feature = "launchpad-pro-mk3")]
+    pub fn read_user(&mut self, offset: u32, data: &mut [u8]) -> bool {
+        if !self.present || offset as usize + data.len() > USER_SIZE as usize {
+            return false;
+        }
+        let Some(flash) = self.flash.as_mut() else { return false };
+        flash.read(USER_OFFSET + offset, data).is_ok()
+    }
+
+    /// Writes to the user data area with read-modify-erase-write per 4 KB sector (only sectors that change).
+    #[cfg(feature = "launchpad-pro-mk3")]
+    pub fn write_user(&mut self, offset: u32, data: &[u8]) -> bool {
+        if !self.present || offset as usize + data.len() > USER_SIZE as usize {
+            return false;
+        }
+        let (flash, sector_buf) = (&mut self.flash, &mut self.sector_buf);
+        let Some(flash) = flash.as_mut() else { return false };
+        let mut abs = USER_OFFSET + offset;
+        let mut src = data;
+        while !src.is_empty() {
+            let sector_base = abs & !((SECTOR_SIZE as u32) - 1);
+            let in_sector = (abs - sector_base) as usize;
+            let chunk = min(src.len(), SECTOR_SIZE - in_sector);
+            if flash.read(sector_base, sector_buf).is_err() {
+                return false;
+            }
+            if sector_buf[in_sector..in_sector + chunk] != src[..chunk] {
+                sector_buf[in_sector..in_sector + chunk].copy_from_slice(&src[..chunk]);
+                if flash.erase_sectors(sector_base, 1).is_err() {
+                    return false;
+                }
+                for page_off in (0..SECTOR_SIZE).step_by(PAGE_SIZE) {
+                    if !sector_buf[page_off..page_off + PAGE_SIZE].iter().all(|b| *b == 0xff)
+                        && flash
+                            .write_bytes(sector_base + page_off as u32, &mut sector_buf[page_off..page_off + PAGE_SIZE])
+                            .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+            abs += chunk as u32;
+            src = &src[chunk..];
+        }
+        true
     }
 
     pub const fn settings_size(&self) -> u32 {

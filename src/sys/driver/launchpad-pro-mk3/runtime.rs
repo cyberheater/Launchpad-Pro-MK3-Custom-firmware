@@ -254,7 +254,14 @@ impl Driver for RuntimeDriver {
     }
 
     fn send_midi(&mut self, port: crate::sys::midi::MidiPort, data: &[u8]) {
-        let _ = super::usb::enqueue_tx_message(port.as_cable(), data);
+        use crate::sys::midi::MidiPort;
+        match port {
+            MidiPort::Din => super::din::send(1, data),
+            MidiPort::Din2 => super::din::send(2, data),
+            _ => {
+                let _ = super::usb::enqueue_tx_message(port.as_cable(), data);
+            }
+        }
     }
 
     fn flash_size(&mut self) -> u32 {
@@ -269,6 +276,18 @@ impl Driver for RuntimeDriver {
 
     fn write_flash(&mut self, offset: u32, data: &[u8]) {
         let _ = self.flash.write(offset, data);
+    }
+
+    fn user_storage_size(&mut self) -> u32 {
+        if self.flash.capacity() > 0 { crate::sys::driver::common::storage::external::USER_SIZE } else { 0 }
+    }
+
+    fn read_user_storage(&mut self, offset: u32, data: &mut [u8]) -> bool {
+        self.flash.read_user(offset, data)
+    }
+
+    fn write_user_storage(&mut self, offset: u32, data: &[u8]) -> bool {
+        self.flash.write_user(offset, data)
     }
 
     fn prepare_settings_storage(&mut self, wire_size: usize, validate: fn(&[u8]) -> bool) {

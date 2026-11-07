@@ -6,16 +6,23 @@ use crate::app::events::{AftertouchEvent, MidiEvent, SurfaceEvent};
 use crate::driver;
 use crate::sys::led;
 use crate::sys::midi::MidiPort;
+use crate::app::AppId;
 #[cfg(feature = "launchpad-pro-mk3")]
 use crate::sys::rotation;
 use crate::sys::settings;
 use crate::utils::layout;
 
-pub struct PerformanceApp;
+pub struct PerformanceApp {
+    switch: Option<AppId>,
+}
+
+/// Top-row Sequencer button (Programmer-mode index) opens the step sequencer.
+#[cfg(feature = "launchpad-pro-mk3")]
+const BTN_SEQUENCER: u8 = 97;
 
 impl PerformanceApp {
     pub const fn new() -> Self {
-        Self
+        Self { switch: None }
     }
 }
 
@@ -25,6 +32,13 @@ impl App for PerformanceApp {
     fn on_exit(&mut self) {}
 
     fn on_surface(&mut self, event: SurfaceEvent) {
+        #[cfg(feature = "launchpad-pro-mk3")]
+        if event.index == BTN_SEQUENCER {
+            if event.pressed {
+                self.switch = Some(AppId::Sequencer);
+            }
+            return;
+        }
         #[cfg(feature = "launchpad-pro-mk3")]
         let index =
             if settings::with(|s| s.mirror_enabled) != 0 && (100..=110).contains(&event.index) {
@@ -150,6 +164,10 @@ impl App for PerformanceApp {
     }
 
     fn on_tick(&mut self) {}
+
+    fn take_requested_app_switch(&mut self) -> Option<AppId> {
+        self.switch.take()
+    }
 }
 
 pub(crate) fn apply_velocity_curve(curve: u8, value: u8) -> u8 {

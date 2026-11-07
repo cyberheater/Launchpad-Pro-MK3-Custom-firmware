@@ -7,6 +7,8 @@ pub enum MidiPort {
     Daw = 0,
     Midi = 1,
     Din = 2,
+    /// Second DIN output (Launchpad Pro MK3 has two)
+    Din2 = 3,
 }
 
 impl MidiPort {

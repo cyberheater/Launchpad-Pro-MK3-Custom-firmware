@@ -6,6 +6,8 @@ use crate::app::daw::DawApp;
 use crate::app::palette_editor::PaletteEditorApp;
 use crate::app::performance::PerformanceApp;
 use crate::app::programmer::ProgrammerApp;
+#[cfg(feature = "launchpad-pro-mk3")]
+use crate::app::sequencer::SequencerApp;
 use crate::app::setup::SetupApp;
 use crate::app::{AftertouchEvent, App, AppId, MidiEvent, SurfaceEvent};
 use crate::sys::led;
@@ -31,6 +33,10 @@ pub struct AppHost {
     daw: DawApp,
     pending_host_switch: Option<AppId>,
     palette_editor: PaletteEditorApp,
+    #[cfg(feature = "launchpad-pro-mk3")]
+    sequencer: SequencerApp,
+    #[cfg(feature = "launchpad-pro-mk3")]
+    sequencer_led: Option<bool>,
     #[cfg(feature = "no-setup-btn")]
     setup_hold_ticks: u16,
     #[cfg(feature = "no-setup-btn")]
@@ -52,6 +58,10 @@ impl AppHost {
             daw: DawApp::new(),
             pending_host_switch: None,
             palette_editor: PaletteEditorApp::new(),
+            #[cfg(feature = "launchpad-pro-mk3")]
+            sequencer: SequencerApp::new(),
+            #[cfg(feature = "launchpad-pro-mk3")]
+            sequencer_led: None,
             previous_app: current,
             #[cfg(feature = "no-setup-btn")]
             setup_hold_ticks: 0,
@@ -72,6 +82,10 @@ impl AppHost {
             AppId::Programmer => &mut self.programmer,
             AppId::Daw => &mut self.daw,
             AppId::PaletteEditor => &mut self.palette_editor,
+            #[cfg(feature = "launchpad-pro-mk3")]
+            AppId::Sequencer => &mut self.sequencer,
+            #[cfg(not(feature = "launchpad-pro-mk3"))]
+            AppId::Sequencer => &mut self.performance,
         }
     }
 
@@ -95,6 +109,10 @@ impl AppHost {
         self.current = app;
 
         led::clear();
+        #[cfg(feature = "launchpad-pro-mk3")]
+        {
+            self.sequencer_led = None;
+        }
 
         if app == AppId::Setup {
             self.setup.set_current_mode(self.previous_app);
@@ -145,6 +163,12 @@ impl AppHost {
             }
             self.daw.receive_midi(event);
             return;
+        }
+
+        // MIDI clock / start / continue / stop drive the sequencer whatever app is in front.
+        #[cfg(feature = "launchpad-pro-mk3")]
+        if matches!(event.status, 0xF8 | 0xFA | 0xFB | 0xFC) {
+            self.sequencer.on_realtime(event.status);
         }
 
         if self.current == AppId::Daw {
@@ -216,7 +240,26 @@ impl AppHost {
 
         led::tick();
         self.active_app_mut().on_tick();
+        #[cfg(feature = "launchpad-pro-mk3")]
+        if self.current != AppId::Sequencer {
+            // Background playback: the sequencer keeps running while another app is in front.
+            self.sequencer.run_engine();
+            self.show_sequencer_state();
+        }
         self.apply_requested_app_switch();
+    }
+
+    #[cfg(feature = "launchpad-pro-mk3")]
+    /// In note mode the Sequencer button shows green while the sequencer plays in the background.
+    fn show_sequencer_state(&mut self) {
+        if self.current != AppId::Performance {
+            return;
+        }
+        let playing = self.sequencer.is_playing();
+        if self.sequencer_led != Some(playing) {
+            self.sequencer_led = Some(playing);
+            led::set(97, if playing { 0x00C000 } else { 0 });
+        }
     }
 
     fn apply_requested_app_switch(&mut self) {
