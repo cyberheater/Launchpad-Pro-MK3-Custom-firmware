@@ -2,6 +2,7 @@
 //
 // DIN MIDI outputs of the Launchpad Pro MK3, matching the stock 4.40 firmware's hardware setup:
 //   DIN Out 1 = UART4 TX on PA0 (AF8), DIN Out 2 = UART7 TX on PE8 (AF8), DIN In = UART4 RX on PC11 (AF8).
+//   PA7 low selects the second jack as Out 2 (not Thru).
 //   31250 baud 8N1 from APB1 = 54 MHz. TX inverted (CR2.TXINV, as stock does: the output stage inverts again);
 //   RX not inverted.
 // Transmission is interrupt driven (TXE) from a 2 KB ring buffer per output, so sending never blocks. A DIN out carries
@@ -113,6 +114,11 @@ pub fn init() {
         w.set_uart4en(true);
         w.set_uart7en(true);
     });
+
+    // PA7 = MIDI Out 2 / Thru select: the stock firmware drives it low (an output, 0), which makes the second jack
+    // MIDI Out 2 (UART7). Left floating it is Thru: the jack then just repeats MIDI In.
+    pac::GPIOA.bsrr().write(|w| w.set_br(7, true));
+    pac::GPIOA.moder().modify(|w| w.set_moder(7, pac::gpio::vals::Moder::OUTPUT));
 
     // PA0 -> AF8 (UART4_TX), PE8 -> AF8 (UART7_TX)
     pac::GPIOA.moder().modify(|w| w.set_moder(0, pac::gpio::vals::Moder::ALTERNATE));
