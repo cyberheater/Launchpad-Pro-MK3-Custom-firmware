@@ -236,6 +236,8 @@ impl Track {
 #[derive(Copy, Clone)]
 struct NoteOff {
     due_us: u64,
+    /// When its note-on went out (to recognise a keyboard echoing it straight back).
+    sent_us: u64,
     output: Output,
     channel: u8,
     note: u8,
@@ -260,6 +262,8 @@ pub struct SequencerApp {
     step_edited: bool,
     held_track: Option<usize>,
     preview: Option<(u8, Output, u8)>,
+    /// When the preview note went out.
+    preview_us: u64,
     shift: bool,
     fixed_length: bool,
     clear: bool,
@@ -400,6 +404,7 @@ impl SequencerApp {
             step_edited: false,
             held_track: None,
             preview: None,
+            preview_us: 0,
             shift: false,
             fixed_length: false,
             clear: false,
@@ -605,7 +610,7 @@ impl SequencerApp {
                     let note = (n as i16 + transpose as i16).clamp(0, 127) as u8;
                     self.note_off_now(output, channel, note);
                     send(output, &[0x90 | channel, note, step.velocity]);
-                    self.schedule_off(NoteOff { due_us: time + gate_us, output, channel, note });
+                    self.schedule_off(NoteOff { due_us: time + gate_us, sent_us: now_us(), output, channel, note });
                 }
             }
             let tr = &mut self.tracks[t];
@@ -708,14 +713,19 @@ impl SequencerApp {
     //
     // A keyboard on DIN In / the USB MIDI port plays the selected track's sound: its notes and controllers are
     // re-sent on that track's output and channel (whatever channel the keyboard sends on). Keyboards with MIDI Thru
-    // echo what we send back to us, so: a note-on for a note thru is already holding, or for a note the sequencer is
-    // sounding right now on that channel, is an echo and is ignored (also not recorded); a note-off for a note thru is
+    // echo what we send back to us, so: a note-on for a note thru is already holding, or for a note the sequencer sent
+    // on that channel in the last 30 ms, is an echo and is ignored (also not recorded); a note-off for a note thru is
     // not holding is ignored; a controller identical to the last one forwarded within 100 ms is ignored.
 
-    /// Is this incoming note our own output coming back (sequencer playback or a pad preview)?
+    /// Is this incoming note our own output coming back (sequencer playback or a pad preview)? An echo arrives within
+    /// a few ms of what we sent, so only a note sent in the last ECHO_WINDOW_US counts; the same note played on purpose
+    /// later (e.g. doubling a part that is playing) still gets through.
     fn is_echo(&self, channel: u8, note: u8) -> bool {
-        self.offs.iter().flatten().any(|o| o.channel == channel && o.note == note)
-            || matches!(self.preview, Some((n, _, c)) if n == note && c == channel)
+        const ECHO_WINDOW_US: u64 = 30_000;
+        let now = now_us();
+        let recent = |t: u64| now.saturating_sub(t) < ECHO_WINDOW_US;
+        self.offs.iter().flatten().any(|o| o.channel == channel && o.note == note && recent(o.sent_us))
+            || matches!(self.preview, Some((n, _, c)) if n == note && c == channel && recent(self.preview_us))
     }
 
     /// Returns false when the note was ignored as an echo.
@@ -847,6 +857,7 @@ impl SequencerApp {
             }
             send(output, &[0x90 | channel, note, value.max(1).min(127)]);
             self.preview = Some((note, output, channel));
+            self.preview_us = now_us();
             if self.held_step.is_none() {
                 self.record_note_on(note, value.max(1));
             }
