@@ -10,7 +10,7 @@
 //   101-108          track select (the row under the grid).
 //   1-8              track mutes.
 //   Hold a track button: steps 1-16 show/set its MIDI channel; note row 1 pads 1-4 set its output
-//                    (USB, DIN 1, DIN 2, DIN 1+2).
+//                    (USB, DIN 1, DIN 2, DIN 1+2; new tracks start on DIN 1, channel = track number).
 //   Hold a step:     right-hand column = velocity bar (top = 127 ... bottom = 16), bottom row = gate length in
 //                    eighths of a step (1 = shortest, 8 = whole step); a lit step tapped and released without an edit
 //                    turns off. Step brightness follows velocity.
@@ -141,7 +141,8 @@ impl Track {
             chain_end: 0,
             queued: None,
             channel,
-            output: Output::Usb,
+            // New tracks play out of DIN 1 (the point of a standalone sequencer); change per track as needed.
+            output: Output::Din1,
             muted: false,
             note: 60,
             base: 48,
