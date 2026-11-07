@@ -2,7 +2,8 @@
 //
 // DIN MIDI outputs of the Launchpad Pro MK3, matching the stock 4.40 firmware's hardware setup:
 //   DIN Out 1 = UART4 TX on PA0 (AF8), DIN Out 2 = UART7 TX on PE8 (AF8), DIN In = UART4 RX on PC11 (AF8).
-//   31250 baud 8N1 from APB1 = 54 MHz, non-inverted.
+//   31250 baud 8N1 from APB1 = 54 MHz. TX inverted (CR2.TXINV, as stock does: the output stage inverts again);
+//   RX not inverted.
 // Transmission is interrupt driven (TXE) from a 2 KB ring buffer per output, so sending never blocks. A DIN out carries
 // only ~1000 three-byte messages a second, so the output side:
 //   - queues whole messages only: when the ring is full, a message is dropped entirely (never cut off part-way, which
@@ -127,6 +128,9 @@ pub fn init() {
         let u = uart(out);
         u.cr1().write(|_| {});
         u.brr().write_value(pac::usart::regs::Brr(BRR_31250 as u32));
+        // The MIDI out stage inverts the signal, so the UART must send inverted (stock 4.40 writes CR2 = TXINV on both;
+        // without it a real device receives garbage). Must be set while the UART is disabled.
+        u.cr2().write(|w| w.set_txinv(true));
         u.cr1().write(|w| {
             w.set_ue(true);
             w.set_te(true);
