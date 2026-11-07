@@ -26,6 +26,10 @@
 //   Fixed Length (30) held + step pad: set the pattern length to that step.
 //   Clear (60) held + step pad: clear the step; + track button: clear the track's current pattern.
 //   Note (94)        back to the note/performance app; playback continues there (Sequencer button lit green).
+//   Record (10)      tap: arm / disarm live recording (red). While armed and playing, notes played on the note pads or
+//                    arriving on the USB MIDI port / DIN In (e.g. a keyboard) are written into the selected track's
+//                    current pattern at the nearest step, with their velocity and held length as the gate (up to one
+//                    step). A note recorded just ahead of a step is not replayed on that pass (you already heard it).
 //   Projects (98)    tap: save to the current project slot. Hold: the track row shows the 8 slots (white = current,
 //                    dim = saved, off = empty); tap one to load it (an empty slot just becomes the save target).
 //                    The Projects LED is green when everything is saved, amber with unsaved changes.
@@ -60,6 +64,7 @@ const BTN_DUPLICATE: u8 = 50;
 const BTN_FIXED_LENGTH: u8 = 30;
 const BTN_PLAY: u8 = 20;
 const BTN_PROJECTS: u8 = 98;
+const BTN_RECORD: u8 = 10;
 const BTN_PATTERNS: u8 = 89;
 
 const TRACK_COLOURS: [u32; TRACKS] =
@@ -222,6 +227,15 @@ pub struct SequencerApp {
     ext_active: bool,
     ext_last_pulse_us: u64,
     ext_interval_us: u64,
+    /// Live recording armed (Record button); records while playing.
+    record_armed: bool,
+    /// Time and length of the last played step (for quantising recorded notes).
+    last_step_us: u64,
+    last_step_len_us: u64,
+    /// Notes being recorded, waiting for their note-off: (note, track, step, start time).
+    rec_held: [Option<(u8, u8, u8, u64)>; 8],
+    /// Per track: a step just recorded ahead of the playhead, not to be replayed on this pass.
+    skip_once: [Option<u8>; TRACKS],
 }
 
 /// Microseconds since boot. Uses the system timer where embassy-time exists; the Launchpad S / Mini MK1 builds
@@ -344,6 +358,11 @@ impl SequencerApp {
             ext_active: false,
             ext_last_pulse_us: 0,
             ext_interval_us: 20_833,
+            record_armed: false,
+            last_step_us: 0,
+            last_step_len_us: 125_000,
+            rec_held: [None; 8],
+            skip_once: [None; TRACKS],
         }
     }
 
@@ -444,6 +463,8 @@ impl SequencerApp {
 
     fn stop(&mut self) {
         self.playing = false;
+        self.rec_held = [None; 8];
+        self.skip_once = [None; TRACKS];
         self.pending_step = None;
         self.stop_notes();
         for t in self.tracks.iter_mut() {
@@ -502,13 +523,19 @@ impl SequencerApp {
     }
 
     fn play_step(&mut self, time: u64, step_us: u64) {
+        self.last_step_us = time;
+        self.last_step_len_us = step_us;
         for t in 0..TRACKS {
             let (pos, step, muted, output, channel, transpose) = {
                 let tr = &self.tracks[t];
                 let pos = tr.position as usize % STEPS;
                 (pos, tr.pat().steps[pos], tr.muted, tr.output, tr.channel, tr.transpose)
             };
-            if step.on && !muted && (step.prob >= 100 || self.random_percent() <= step.prob) {
+            let skip = self.skip_once[t] == Some(pos as u8);
+            if skip {
+                self.skip_once[t] = None;
+            }
+            if step.on && !muted && !skip && (step.prob >= 100 || self.random_percent() <= step.prob) {
                 let note = (step.note as i16 + transpose as i16).clamp(0, 127) as u8;
                 self.note_off_now(output, channel, note);
                 send(output, &[0x90 | channel, note, step.velocity]);
@@ -552,6 +579,49 @@ impl SequencerApp {
                 if now >= off.due_us {
                     send(off.output, &[0x80 | off.channel, off.note, 0]);
                     *slot = None;
+                }
+            }
+        }
+    }
+
+    // ---------------- live recording ----------------
+
+    /// Writes a played note into the selected track at the nearest step (if recording).
+    fn record_note_on(&mut self, note: u8, velocity: u8) {
+        if !(self.record_armed && self.playing) {
+            return;
+        }
+        let t = self.selected;
+        let now = now_us();
+        let tr = &mut self.tracks[t];
+        let len = tr.pat().length.clamp(1, STEPS as u8);
+        let Some(last) = tr.playing_step else { return };
+        // Early in the current step: it belongs to the step that just played; late: to the next one.
+        let late = now.saturating_sub(self.last_step_us) >= self.last_step_len_us / 2;
+        let step = if late { (last + 1) % len } else { last };
+        tr.pat_mut().steps[step as usize] = Step { on: true, note, velocity: velocity.clamp(1, 127), ..Step::OFF };
+        if late {
+            self.skip_once[t] = Some(step);
+        }
+        if let Some(slot) = self.rec_held.iter_mut().find(|s| s.is_none()) {
+            *slot = Some((note, t as u8, step, now));
+        }
+        self.dirty = true;
+    }
+
+    /// Note released: its held length becomes the gate (in eighths of a step, 1-8).
+    fn record_note_off(&mut self, note: u8) {
+        let now = now_us();
+        let step_len = self.last_step_len_us.max(1);
+        for slot in self.rec_held.iter_mut() {
+            if let Some((n, t, step, start)) = *slot {
+                if n == note {
+                    *slot = None;
+                    let gate = ((now.saturating_sub(start) * 8 + step_len / 2) / step_len).clamp(1, 8) as u8;
+                    let s = &mut self.tracks[t as usize].pat_mut().steps[step as usize];
+                    if s.on && s.note == note {
+                        s.gate = gate;
+                    }
                 }
             }
         }
@@ -631,11 +701,17 @@ impl SequencerApp {
             }
             send(output, &[0x90 | channel, note, value.max(1).min(127)]);
             self.preview = Some((note, output, channel));
-        } else if let Some((n, o, c)) = self.preview {
-            if n == note {
-                send(o, &[0x80 | c, n, 0]);
-                self.preview = None;
+            if self.held_step.is_none() {
+                self.record_note_on(note, value.max(1));
             }
+        } else {
+            if let Some((n, o, c)) = self.preview {
+                if n == note {
+                    send(o, &[0x80 | c, n, 0]);
+                    self.preview = None;
+                }
+            }
+            self.record_note_off(note);
         }
         self.dirty = true;
     }
@@ -1046,6 +1122,7 @@ impl SequencerApp {
         led::set(BTN_CLEAR, if self.clear { 0xFF4040 } else { 0x200808 });
         led::set(BTN_DUPLICATE, if self.duplicate { 0xFFFFFF } else { 0x202020 });
         led::set(BTN_FIXED_LENGTH, if self.fixed_length { 0xFFFFFF } else { 0x202020 });
+        led::set(BTN_RECORD, if self.record_armed { if self.playing { 0xFF0000 } else { 0xA00000 } } else { 0x200000 });
         let projects = if !project::available() {
             0
         } else if now_us() < self.save_flash_until {
@@ -1152,6 +1229,10 @@ impl App for SequencerApp {
                     }
                     self.dirty = true;
                 }
+                BTN_RECORD if event.pressed => {
+                    self.record_armed = !self.record_armed;
+                    self.dirty = true;
+                }
                 BTN_PLAY if event.pressed => {
                     if self.playing { self.stop() } else { self.start() }
                 }
@@ -1175,7 +1256,16 @@ impl App for SequencerApp {
         }
     }
 
-    fn on_midi(&mut self, _event: MidiEvent) {}
+    fn on_midi(&mut self, event: MidiEvent) {
+        if !matches!(event.port, MidiPort::Midi | MidiPort::Din) {
+            return;
+        }
+        match event.status & 0xF0 {
+            0x90 if event.data2 > 0 => self.record_note_on(event.data1 & 0x7F, event.data2),
+            0x80 | 0x90 => self.record_note_off(event.data1 & 0x7F),
+            _ => {}
+        }
+    }
 
     fn on_aftertouch(&mut self, _event: AftertouchEvent) {}
 
