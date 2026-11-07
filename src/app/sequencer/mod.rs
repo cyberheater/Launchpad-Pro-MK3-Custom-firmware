@@ -32,6 +32,9 @@
 //                    current pattern at the nearest step, with their velocity and held length as the gate (up to one
 //                    step). A note recorded just ahead of a step is not replayed on that pass (you already heard it).
 //                    Notes played together land on the same step as a chord (up to 8; loudest velocity kept).
+//   MIDI thru        a keyboard on the USB MIDI port / DIN In plays the selected track: notes, aftertouch, controllers,
+//                    program change and pitch bend are re-sent on that track's output and channel. Echoes from a
+//                    keyboard with MIDI Thru are recognised and dropped (no loops, no double recording).
 //   Projects (98)    tap: save to the current project slot. Hold: the track row shows the 8 slots (white = current,
 //                    dim = saved, off = empty); tap one to load it (an empty slot just becomes the save target).
 //                    The Projects LED is green when everything is saved, amber with unsaved changes.
@@ -289,6 +292,10 @@ pub struct SequencerApp {
     rec_step: Option<(u8, u8, u64)>,
     /// A note pad has been tapped during the current step hold (the first tap replaces the chord, later ones add).
     hold_notes_set: bool,
+    /// Keyboard notes being passed through: (note, output, channel), so note-offs follow their note-ons.
+    thru_held: [Option<(u8, Output, u8)>; 16],
+    /// Last non-note message passed through ((kind, data1, data2), time): its echo is dropped.
+    thru_last: ((u8, u8, u8), u64),
 }
 
 /// Microseconds since boot. Uses the system timer where embassy-time exists; the Launchpad S / Mini MK1 builds
@@ -418,6 +425,8 @@ impl SequencerApp {
             skip_once: [None; TRACKS],
             rec_step: None,
             hold_notes_set: false,
+            thru_held: [None; 16],
+            thru_last: ((0, 0, 0), 0),
         }
     }
 
@@ -692,6 +701,66 @@ impl SequencerApp {
                     }
                 }
             }
+        }
+    }
+
+    // ---------------- MIDI thru ----------------
+    //
+    // A keyboard on DIN In / the USB MIDI port plays the selected track's sound: its notes and controllers are
+    // re-sent on that track's output and channel (whatever channel the keyboard sends on). Keyboards with MIDI Thru
+    // echo what we send back to us, so: a note-on for a note thru is already holding, or for a note the sequencer is
+    // sounding right now on that channel, is an echo and is ignored (also not recorded); a note-off for a note thru is
+    // not holding is ignored; a controller identical to the last one forwarded within 100 ms is ignored.
+
+    /// Is this incoming note our own output coming back (sequencer playback or a pad preview)?
+    fn is_echo(&self, channel: u8, note: u8) -> bool {
+        self.offs.iter().flatten().any(|o| o.channel == channel && o.note == note)
+            || matches!(self.preview, Some((n, _, c)) if n == note && c == channel)
+    }
+
+    /// Returns false when the note was ignored as an echo.
+    fn thru_note_on(&mut self, in_channel: u8, note: u8, velocity: u8) -> bool {
+        if self.thru_held.iter().flatten().any(|h| h.0 == note) || self.is_echo(in_channel, note) {
+            return false;
+        }
+        let tr = &self.tracks[self.selected];
+        let (output, channel) = (tr.output, tr.channel);
+        send(output, &[0x90 | channel, note, velocity]);
+        match self.thru_held.iter_mut().find(|h| h.is_none()) {
+            Some(slot) => *slot = Some((note, output, channel)),
+            None => send(output, &[0x80 | channel, note, 0]), // more keys held than we track: cut it short
+        }
+        true
+    }
+
+    /// Note-off goes where its note-on went, even if another track was selected meanwhile. False = not ours.
+    fn thru_note_off(&mut self, note: u8) -> bool {
+        for slot in self.thru_held.iter_mut() {
+            if let Some((n, output, channel)) = *slot {
+                if n == note {
+                    *slot = None;
+                    send(output, &[0x80 | channel, note, 0]);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Aftertouch, controllers, program change, channel pressure, pitch bend: to the selected track's channel.
+    fn thru_other(&mut self, event: MidiEvent) {
+        let now = now_us();
+        let key = (event.status & 0xF0, event.data1, event.data2);
+        if self.thru_last.0 == key && now.saturating_sub(self.thru_last.1) < 100_000 {
+            return; // our own message echoed back
+        }
+        self.thru_last = (key, now);
+        let tr = &self.tracks[self.selected];
+        let status = key.0 | tr.channel;
+        if matches!(key.0, 0xC0 | 0xD0) {
+            send(tr.output, &[status, event.data1]);
+        } else {
+            send(tr.output, &[status, event.data1, event.data2]);
         }
     }
 
@@ -1346,9 +1415,20 @@ impl App for SequencerApp {
         if !matches!(event.port, MidiPort::Midi | MidiPort::Din) {
             return;
         }
-        match event.status & 0xF0 {
-            0x90 if event.data2 > 0 => self.record_note_on(event.data1 & 0x7F, event.data2),
-            0x80 | 0x90 => self.record_note_off(event.data1 & 0x7F),
+        let (kind, channel) = (event.status & 0xF0, event.status & 0x0F);
+        let note = event.data1 & 0x7F;
+        match kind {
+            0x90 if event.data2 > 0 => {
+                if self.thru_note_on(channel, note, event.data2) {
+                    self.record_note_on(note, event.data2);
+                }
+            }
+            0x80 | 0x90 => {
+                if self.thru_note_off(note) {
+                    self.record_note_off(note);
+                }
+            }
+            0xA0..=0xE0 => self.thru_other(event),
             _ => {}
         }
     }
