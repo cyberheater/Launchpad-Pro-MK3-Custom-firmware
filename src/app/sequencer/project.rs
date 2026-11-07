@@ -2,16 +2,16 @@
 //
 // Sequencer project storage in the driver's user storage area.
 //
-// Version 3 (current): 8 slots of 16 KB at V2_BASE (the same slots as version 2), meta record after them.
-//   0    "LPS2", u8 version 3, u16 bpm, u8 swing (50-75 %), 8 reserved      = 16 bytes
-//   16   8 tracks x 1816 bytes:
+// Version 4 (current): 8 slots of 32 KB at V4_BASE; the last-used-slot record stays at META_OFFSET.
+//   0    "LPS2", u8 version 4, u16 bpm, u8 swing (50-75 %), 8 reserved      = 16 bytes
+//   16   8 tracks x 2840 bytes:
 //          16 bytes settings: channel, output, muted, note, base, pattern, chain start, chain end, transpose (i8),
 //                             7 reserved
-//          8 patterns x 225 bytes: length, then 32 steps x 7 bytes
-//                             (on << 7 | note 1, notes 2-4 (0xFF = none), velocity, gate 1-8, probability 1-100 %)
-//   14544 u32 CRC-32 (IEEE) of bytes 0..14544
-// Version 2 (read): as version 3 but one note per step, 4 bytes per step (on << 7 | note, velocity, gate, prob);
-//   8 x 1048-byte tracks, CRC at 8400.
+//          8 patterns x 353 bytes: length, then 32 steps x 11 bytes
+//                             (on << 7 | note 1, notes 2-8 (0xFF = none), velocity, gate 1-8, probability 1-100 %)
+//   22736 u32 CRC-32 (IEEE) of bytes 0..22736
+// Versions 3 and 2 (read): 8 slots of 16 KB at V2_BASE, same layout with 4 notes (7-byte steps) or 1 note
+//   (4-byte steps: on << 7 | note, velocity, gate, prob). A slot with a valid v4 record wins over its old copy.
 // Version 1 (read-only import): 8 slots of 4 KB at offset 0, "LPS1", one pattern per track, 2 bytes per step.
 
 use core::cell::UnsafeCell;
@@ -24,33 +24,43 @@ pub const PATTERNS: usize = 8;
 pub const STEPS: usize = 32;
 
 const V2_BASE: u32 = 0x0004_0000;
-const SLOT_SIZE: u32 = 0x4000;
-const META_OFFSET: u32 = V2_BASE + SLOTS as u32 * SLOT_SIZE;
+const V2_SLOT_SIZE: u32 = 0x4000;
+const META_OFFSET: u32 = V2_BASE + SLOTS as u32 * V2_SLOT_SIZE;
+const V4_BASE: u32 = 0x0008_0000;
+const SLOT_SIZE: u32 = 0x8000;
 const MAGIC: [u8; 4] = *b"LPS2";
 const META_MAGIC: [u8; 4] = *b"LPSN";
 
-pub const MAX_NOTES: usize = 4;
+pub const MAX_NOTES: usize = 8;
 pub const NO_NOTE: u8 = 0xFF;
 
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 pub const HEADER: usize = 16;
 pub const TRACK_SETTINGS: usize = 16;
-pub const STEP_BYTES: usize = 7;
+pub const STEP_BYTES: usize = MAX_NOTES + 3;
 pub const PATTERN_BYTES: usize = 1 + STEPS * STEP_BYTES;
 pub const TRACK_BYTES: usize = TRACK_SETTINGS + PATTERNS * PATTERN_BYTES;
 pub const BODY: usize = HEADER + TRACKS * TRACK_BYTES;
 pub const RECORD: usize = BODY + 4;
 const _: () = assert!(RECORD as u32 <= SLOT_SIZE);
 
-// ---- v2 (read) ----
-pub const V2_STEP_BYTES: usize = 4;
-pub const V2_PATTERN_BYTES: usize = 1 + STEPS * V2_STEP_BYTES;
-pub const V2_TRACK_BYTES: usize = TRACK_SETTINGS + PATTERNS * V2_PATTERN_BYTES;
-const V2_BODY: usize = HEADER + TRACKS * V2_TRACK_BYTES;
+const _: () = assert!(V4_BASE + SLOTS as u32 * SLOT_SIZE <= 0x10_0000);
 
-/// Layout of a stored record: (step bytes, pattern bytes, track bytes).
-pub fn layout(version: u8) -> (usize, usize, usize) {
-    if version == 2 { (V2_STEP_BYTES, V2_PATTERN_BYTES, V2_TRACK_BYTES) } else { (STEP_BYTES, PATTERN_BYTES, TRACK_BYTES) }
+/// Layout of a stored record by version: (step bytes, pattern bytes, track bytes, notes per step).
+pub const fn layout(version: u8) -> (usize, usize, usize, usize) {
+    let notes = match version {
+        2 => 1,
+        3 => 4,
+        _ => MAX_NOTES,
+    };
+    let step = if notes == 1 { 4 } else { notes + 3 };
+    let pattern = 1 + STEPS * step;
+    let track = TRACK_SETTINGS + PATTERNS * pattern;
+    (step, pattern, track, notes)
+}
+
+const fn body(version: u8) -> usize {
+    HEADER + TRACKS * layout(version).2
 }
 
 // ---- v1 (import only) ----
@@ -103,7 +113,7 @@ pub fn crc32(data: &[u8]) -> u32 {
     c.value()
 }
 
-/// One shared record buffer (~14 KB) for save/load; the sequencer only runs on the main loop.
+/// One shared record buffer (~22 KB) for save/load; the sequencer only runs on the main loop.
 struct Buffer(UnsafeCell<[u8; RECORD]>);
 unsafe impl Sync for Buffer {}
 static BUFFER: Buffer = Buffer(UnsafeCell::new([0; RECORD]));
@@ -113,7 +123,7 @@ pub fn with_buffer<R>(f: impl FnOnce(&mut [u8; RECORD]) -> R) -> R {
 }
 
 pub fn available() -> bool {
-    driver::user_storage_size() >= META_OFFSET + 16
+    driver::user_storage_size() >= V4_BASE + SLOTS as u32 * SLOT_SIZE
 }
 
 pub fn header(bpm: u16, swing: u8) -> [u8; HEADER] {
@@ -132,20 +142,37 @@ pub fn seal(rec: &mut [u8; RECORD]) {
 
 fn valid(rec: &[u8; RECORD]) -> bool {
     let body = match rec[4] {
-        2 => V2_BODY,
-        VERSION => BODY,
+        2 | 3 | VERSION => body(rec[4]),
         _ => return false,
     };
     rec[0..4] == MAGIC
         && u32::from_le_bytes([rec[body], rec[body + 1], rec[body + 2], rec[body + 3]]) == crc32(&rec[..body])
 }
 
+/// Quick check for the slot row: does the slot hold a project (header only, no CRC check)?
+pub fn slot_used(slot: usize) -> bool {
+    let mut h = [0u8; 8];
+    slot < SLOTS
+        && ((driver::read_user_storage(V4_BASE + slot as u32 * SLOT_SIZE, &mut h) && h[0..4] == MAGIC && h[4] == VERSION)
+            || (driver::read_user_storage(V2_BASE + slot as u32 * V2_SLOT_SIZE, &mut h)
+                && h[0..4] == MAGIC
+                && matches!(h[4], 2 | 3)))
+}
+
+/// Reads a slot: the current-format record if there is one, else an older v3/v2 record from the old slot area.
 pub fn read_slot(slot: usize, rec: &mut [u8; RECORD]) -> bool {
-    slot < SLOTS && driver::read_user_storage(V2_BASE + slot as u32 * SLOT_SIZE, rec) && valid(rec)
+    if slot >= SLOTS {
+        return false;
+    }
+    if driver::read_user_storage(V4_BASE + slot as u32 * SLOT_SIZE, rec) && rec[4] == VERSION && valid(rec) {
+        return true;
+    }
+    let old = &mut rec[..V2_SLOT_SIZE as usize];
+    driver::read_user_storage(V2_BASE + slot as u32 * V2_SLOT_SIZE, old) && matches!(rec[4], 2 | 3) && valid(rec)
 }
 
 pub fn write_slot(slot: usize, rec: &[u8; RECORD]) -> bool {
-    slot < SLOTS && driver::write_user_storage(V2_BASE + slot as u32 * SLOT_SIZE, rec)
+    slot < SLOTS && driver::write_user_storage(V4_BASE + slot as u32 * SLOT_SIZE, rec)
 }
 
 /// Version-1 record from the earlier single-pattern format, if one exists in this slot.

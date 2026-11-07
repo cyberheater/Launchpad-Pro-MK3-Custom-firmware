@@ -3,9 +3,17 @@
 // DIN MIDI outputs of the Launchpad Pro MK3, matching the stock 4.40 firmware's hardware setup:
 //   DIN Out 1 = UART4 TX on PA0 (AF8), DIN Out 2 = UART7 TX on PE8 (AF8), DIN In = UART4 RX on PC11 (AF8).
 //   31250 baud 8N1 from APB1 = 54 MHz, non-inverted.
-// Transmission is interrupt driven (TXE) from a small ring buffer per output, so sending never blocks. Reception is
-// interrupt driven (RXNE) into a ring buffer; the main loop parses it (running status, real-time, SysEx) with poll().
+// Transmission is interrupt driven (TXE) from a 2 KB ring buffer per output, so sending never blocks. A DIN out carries
+// only ~1000 three-byte messages a second, so the output side:
+//   - queues whole messages only: when the ring is full, a message is dropped entirely (never cut off part-way, which
+//     would garble the stream or leave a note stuck on);
+//   - uses running status: a channel message with the same status as the previous one is sent without its status byte,
+//     and a note-off with velocity 0 goes out as note-on velocity 0, so note-ons and note-offs share one status
+//     (2 bytes instead of 3, ~1/3 more notes per second). Status is sent in full again whenever the line was idle.
+// Reception is interrupt driven (RXNE) into a ring buffer; the main loop parses it (running status, real-time, SysEx)
+// with poll().
 
+use core::cell::Cell;
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use stm32_metapac as pac;
@@ -13,25 +21,37 @@ use stm32_metapac as pac;
 use crate::app::MidiEvent;
 use crate::sys::midi::MidiPort;
 
-const RING: usize = 512;
+const TX_RING: usize = 2048;
+const RX_RING: usize = 512;
 const BRR_31250: u16 = (54_000_000 / 31_250) as u16; // 1728
 
-struct Ring {
-    buf: core::cell::UnsafeCell<[u8; RING]>,
+struct Ring<const N: usize> {
+    buf: core::cell::UnsafeCell<[u8; N]>,
     head: AtomicU16, // written by the producer (main loop)
     tail: AtomicU16, // written by the consumer (UART interrupt)
 }
 
-unsafe impl Sync for Ring {}
+unsafe impl<const N: usize> Sync for Ring<N> {}
 
-impl Ring {
+impl<const N: usize> Ring<N> {
     const fn new() -> Self {
-        Self { buf: core::cell::UnsafeCell::new([0; RING]), head: AtomicU16::new(0), tail: AtomicU16::new(0) }
+        Self { buf: core::cell::UnsafeCell::new([0; N]), head: AtomicU16::new(0), tail: AtomicU16::new(0) }
+    }
+
+    /// Bytes that can still be pushed.
+    fn free(&self) -> usize {
+        let head = self.head.load(Ordering::Relaxed) as usize;
+        let tail = self.tail.load(Ordering::Acquire) as usize;
+        (tail + N - head - 1) % N
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head.load(Ordering::Relaxed) == self.tail.load(Ordering::Acquire)
     }
 
     fn push(&self, b: u8) -> bool {
         let head = self.head.load(Ordering::Relaxed);
-        let next = (head + 1) % RING as u16;
+        let next = (head + 1) % N as u16;
         if next == self.tail.load(Ordering::Acquire) {
             return false; // full: drop the byte
         }
@@ -46,21 +66,39 @@ impl Ring {
             return None;
         }
         let b = unsafe { (*self.buf.get())[tail as usize] };
-        self.tail.store((tail + 1) % RING as u16, Ordering::Release);
+        self.tail.store((tail + 1) % N as u16, Ordering::Release);
         Some(b)
     }
 }
 
-static OUT1: Ring = Ring::new();
-static OUT2: Ring = Ring::new();
-static IN: Ring = Ring::new();
+static OUT1: Ring<TX_RING> = Ring::new();
+static OUT2: Ring<TX_RING> = Ring::new();
+static IN: Ring<RX_RING> = Ring::new();
+
+/// Running status per output (0 = none). Only touched by send(), on the main loop.
+struct Status(Cell<u8>);
+unsafe impl Sync for Status {}
+static STATUS1: Status = Status(Cell::new(0));
+static STATUS2: Status = Status(Cell::new(0));
 
 fn uart(out: u8) -> pac::usart::Usart {
     if out == 1 { pac::UART4 } else { pac::UART7 }
 }
 
-fn ring(out: u8) -> &'static Ring {
+fn ring(out: u8) -> &'static Ring<TX_RING> {
     if out == 1 { &OUT1 } else { &OUT2 }
+}
+
+fn running(out: u8) -> &'static Cell<u8> {
+    if out == 1 { &STATUS1.0 } else { &STATUS2.0 }
+}
+
+/// Data bytes after a channel status byte.
+fn data_len(status: u8) -> usize {
+    match status & 0xF0 {
+        0xC0 | 0xD0 => 1,
+        _ => 2,
+    }
 }
 
 pub fn init() {
@@ -105,13 +143,43 @@ pub fn init() {
     }
 }
 
-/// Queues raw MIDI bytes on DIN Out 1 (`out` = 1) or Out 2 (`out` = 2).
+/// Queues one MIDI message (or any raw bytes, e.g. SysEx) on DIN Out 1 (`out` = 1) or Out 2 (`out` = 2).
+/// All of it is queued, or none of it when there is not enough room.
 pub fn send(out: u8, data: &[u8]) {
-    let r = ring(out);
-    for &b in data {
-        if !r.push(b) {
-            break;
+    let (r, rs) = (ring(out), running(out));
+    if data.is_empty() {
+        return;
+    }
+    if r.is_empty() {
+        rs.set(0); // line idle: send the next status in full
+    }
+    let status = data[0];
+    let mut buf = [0u8; 3];
+    let bytes: &[u8] = if (0x80..0xF0).contains(&status) && data.len() == 1 + data_len(status) {
+        // One channel message: note-off velocity 0 -> note-on velocity 0, then drop a repeated status byte.
+        let status = if status & 0xF0 == 0x80 && data[2] == 0 { 0x90 | (status & 0x0F) } else { status };
+        let n = data.len();
+        if status == rs.get() {
+            buf[..n - 1].copy_from_slice(&data[1..]);
+            &buf[..n - 1]
+        } else {
+            buf[0] = status;
+            buf[1..n].copy_from_slice(&data[1..]);
+            &buf[..n]
         }
+    } else {
+        data
+    };
+    if bytes.len() > r.free() {
+        return; // full: drop the whole message
+    }
+    for &b in bytes {
+        r.push(b);
+    }
+    if (0x80..0xF0).contains(&status) && data.len() == 1 + data_len(status) {
+        rs.set(bytes.first().filter(|&&b| b >= 0x80).copied().unwrap_or(rs.get()));
+    } else if status < 0xF8 {
+        rs.set(0); // anything else but real-time ends running status
     }
     uart(out).cr1().modify(|w| w.set_txeie(true));
 }

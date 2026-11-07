@@ -5,7 +5,7 @@
 // Layout (Programmer-mode XY indices):
 //   Grid rows 8..5   steps 1-32 of the selected track's current pattern (row 8 = steps 1-8). Tap toggles a step.
 //                    Hold a step + tap a note pad = set that step's note; tap more pads in the same hold to build a
-//                    chord (up to 4 notes; tap a lit one again to remove it). Holding a step shows all its notes.
+//                    chord (up to 8 notes; tap a lit one again to remove it). Holding a step shows all its notes.
 //   Grid rows 4..1   32 chromatic notes from the track's base note (row 1 = lowest). Tap = choose the note
 //                    new steps get, and preview it. Up / Down (80 / 70) move the note range by an octave.
 //   101-108          track select (the row under the grid).
@@ -31,7 +31,7 @@
 //                    arriving on the USB MIDI port / DIN In (e.g. a keyboard) are written into the selected track's
 //                    current pattern at the nearest step, with their velocity and held length as the gate (up to one
 //                    step). A note recorded just ahead of a step is not replayed on that pass (you already heard it).
-//                    Notes played together land on the same step as a chord (up to 4; loudest velocity kept).
+//                    Notes played together land on the same step as a chord (up to 8; loudest velocity kept).
 //   Projects (98)    tap: save to the current project slot. Hold: the track row shows the 8 slots (white = current,
 //                    dim = saved, off = empty); tap one to load it (an empty slot just becomes the save target).
 //                    The Projects LED is green when everything is saved, amber with unsaved changes.
@@ -54,7 +54,7 @@ mod project;
 const TRACKS: usize = project::TRACKS;
 const PATTERNS: usize = project::PATTERNS;
 const STEPS: usize = project::STEPS;
-const MAX_OFFS: usize = 80;
+const MAX_OFFS: usize = 160;
 
 const BTN_SHIFT: u8 = 90;
 const BTN_NOTE_MODE: u8 = 94;
@@ -99,7 +99,7 @@ const NO_NOTE: u8 = project::NO_NOTE;
 #[derive(Copy, Clone)]
 struct Step {
     on: bool,
-    /// 1-4 notes, in the order they were added; notes[0] is always set.
+    /// 1-8 notes, in the order they were added; notes[0] is always set.
     notes: [u8; MAX_NOTES],
     velocity: u8,
     /// Gate length in eighths of a step, 1-8 (8 = whole step).
@@ -109,10 +109,17 @@ struct Step {
 }
 
 impl Step {
-    const OFF: Step = Step { on: false, notes: [60, NO_NOTE, NO_NOTE, NO_NOTE], velocity: 100, gate: 4, prob: 100 };
+    const OFF: Step = Step { on: false, notes: Step::chord(60), velocity: 100, gate: 4, prob: 100 };
+
+    /// A note list holding just `note`.
+    const fn chord(note: u8) -> [u8; MAX_NOTES] {
+        let mut notes = [NO_NOTE; MAX_NOTES];
+        notes[0] = note;
+        notes
+    }
 
     fn single(note: u8) -> Step {
-        Step { on: true, notes: [note, NO_NOTE, NO_NOTE, NO_NOTE], ..Step::OFF }
+        Step { on: true, notes: Step::chord(note), ..Step::OFF }
     }
 
     fn notes(&self) -> impl Iterator<Item = u8> + '_ {
@@ -879,7 +886,7 @@ impl SequencerApp {
 
     // ---------------- projects ----------------
 
-    /// Streams the project body (everything before the CRC) to `sink`, in the version-3 layout.
+    /// Streams the project body (everything before the CRC) to `sink`, in the current (version-4) layout.
     fn emit(&self, sink: &mut dyn FnMut(&[u8])) {
         sink(&project::header(self.bpm, self.swing));
         for tr in self.tracks.iter() {
@@ -901,9 +908,9 @@ impl SequencerApp {
                     let o = 1 + i * project::STEP_BYTES;
                     b[o] = ((st.on as u8) << 7) | (st.notes[0] & 0x7f);
                     b[o + 1..o + MAX_NOTES].copy_from_slice(&st.notes[1..]);
-                    b[o + 4] = st.velocity;
-                    b[o + 5] = st.gate;
-                    b[o + 6] = st.prob;
+                    b[o + MAX_NOTES] = st.velocity;
+                    b[o + MAX_NOTES + 1] = st.gate;
+                    b[o + MAX_NOTES + 2] = st.prob;
                 }
                 sink(&b);
             }
@@ -919,9 +926,8 @@ impl SequencerApp {
     fn load_record(&mut self, rec: &[u8; project::RECORD]) {
         self.bpm = u16::from_le_bytes([rec[5], rec[6]]).clamp(30, 300);
         self.swing = rec[7].clamp(50, 75);
-        // Version 2 records have one note per step (4 bytes), version 3 up to four (7 bytes).
-        let v2 = rec[4] == 2;
-        let (step_bytes, pattern_bytes, track_bytes) = project::layout(rec[4]);
+        // Notes stored per step: 1 in version 2, 4 in version 3, 8 in version 4.
+        let (step_bytes, pattern_bytes, track_bytes, stored_notes) = project::layout(rec[4]);
         for (t, tr) in self.tracks.iter_mut().enumerate() {
             let base = project::HEADER + t * track_bytes;
             let s = &rec[base..base + project::TRACK_SETTINGS];
@@ -941,15 +947,13 @@ impl SequencerApp {
                 for (i, st) in pat.steps.iter_mut().enumerate() {
                     let s = &b[1 + i * step_bytes..1 + (i + 1) * step_bytes];
                     st.on = s[0] & 0x80 != 0;
-                    st.notes = [s[0] & 0x7f, NO_NOTE, NO_NOTE, NO_NOTE];
-                    let rest = if v2 { &s[1..] } else {
-                        for (k, &n) in s[1..MAX_NOTES].iter().enumerate() {
-                            if n <= 127 {
-                                st.notes[1 + k] = n;
-                            }
+                    st.notes = Step::chord(s[0] & 0x7f);
+                    for (k, &n) in s[1..stored_notes].iter().enumerate() {
+                        if n <= 127 {
+                            st.notes[1 + k] = n;
                         }
-                        &s[MAX_NOTES..]
-                    };
+                    }
+                    let rest = &s[stored_notes..];
                     st.velocity = rest[0].clamp(1, 127);
                     st.gate = rest[1].clamp(1, 8);
                     st.prob = rest[2].clamp(1, 100);
@@ -984,13 +988,10 @@ impl SequencerApp {
     }
 
     fn scan_slots(&mut self) {
-        let mut saved = [false; project::SLOTS];
-        project::with_buffer(|rec| {
-            for (s, flag) in saved.iter_mut().enumerate() {
-                *flag = project::read_slot(s, rec);
-            }
-        });
-        self.slot_saved = saved;
+        // Headers only: reading and checking every full record took noticeably long on entry.
+        for (s, flag) in self.slot_saved.iter_mut().enumerate() {
+            *flag = project::slot_used(s);
+        }
     }
 
     /// First entry after boot: load the last used project.
