@@ -4,7 +4,8 @@
 //
 // Layout (Programmer-mode XY indices):
 //   Grid rows 8..5   steps 1-32 of the selected track's current pattern (row 8 = steps 1-8). Tap toggles a step.
-//                    Hold a step + tap a note pad = set that step's note.
+//                    Hold a step + tap a note pad = set that step's note; tap more pads in the same hold to build a
+//                    chord (up to 4 notes; tap a lit one again to remove it). Holding a step shows all its notes.
 //   Grid rows 4..1   32 chromatic notes from the track's base note (row 1 = lowest). Tap = choose the note
 //                    new steps get, and preview it. Up / Down (80 / 70) move the note range by an octave.
 //   101-108          track select (the row under the grid).
@@ -30,6 +31,7 @@
 //                    arriving on the USB MIDI port / DIN In (e.g. a keyboard) are written into the selected track's
 //                    current pattern at the nearest step, with their velocity and held length as the gate (up to one
 //                    step). A note recorded just ahead of a step is not replayed on that pass (you already heard it).
+//                    Notes played together land on the same step as a chord (up to 4; loudest velocity kept).
 //   Projects (98)    tap: save to the current project slot. Hold: the track row shows the 8 slots (white = current,
 //                    dim = saved, off = empty); tap one to load it (an empty slot just becomes the save target).
 //                    The Projects LED is green when everything is saved, amber with unsaved changes.
@@ -52,7 +54,7 @@ mod project;
 const TRACKS: usize = project::TRACKS;
 const PATTERNS: usize = project::PATTERNS;
 const STEPS: usize = project::STEPS;
-const MAX_OFFS: usize = 48;
+const MAX_OFFS: usize = 80;
 
 const BTN_SHIFT: u8 = 90;
 const BTN_NOTE_MODE: u8 = 94;
@@ -90,10 +92,15 @@ impl Output {
     const ALL: [Output; 4] = [Output::Usb, Output::Din1, Output::Din2, Output::Din12];
 }
 
+/// Notes per step (a chord). Unused entries hold NO_NOTE.
+const MAX_NOTES: usize = project::MAX_NOTES;
+const NO_NOTE: u8 = project::NO_NOTE;
+
 #[derive(Copy, Clone)]
 struct Step {
     on: bool,
-    note: u8,
+    /// 1-4 notes, in the order they were added; notes[0] is always set.
+    notes: [u8; MAX_NOTES],
     velocity: u8,
     /// Gate length in eighths of a step, 1-8 (8 = whole step).
     gate: u8,
@@ -102,7 +109,42 @@ struct Step {
 }
 
 impl Step {
-    const OFF: Step = Step { on: false, note: 60, velocity: 100, gate: 4, prob: 100 };
+    const OFF: Step = Step { on: false, notes: [60, NO_NOTE, NO_NOTE, NO_NOTE], velocity: 100, gate: 4, prob: 100 };
+
+    fn single(note: u8) -> Step {
+        Step { on: true, notes: [note, NO_NOTE, NO_NOTE, NO_NOTE], ..Step::OFF }
+    }
+
+    fn notes(&self) -> impl Iterator<Item = u8> + '_ {
+        self.notes.iter().copied().filter(|&n| n != NO_NOTE)
+    }
+
+    fn has(&self, note: u8) -> bool {
+        self.notes.contains(&note)
+    }
+
+    /// Adds a note to the chord (no-op if present); when full, the newest note is replaced.
+    fn add(&mut self, note: u8) {
+        if self.has(note) {
+            return;
+        }
+        match self.notes.iter_mut().find(|n| **n == NO_NOTE) {
+            Some(slot) => *slot = note,
+            None => self.notes[MAX_NOTES - 1] = note,
+        }
+    }
+
+    /// Removes a note, keeping at least one.
+    fn remove(&mut self, note: u8) {
+        if self.notes().count() <= 1 {
+            return;
+        }
+        let mut kept = [NO_NOTE; MAX_NOTES];
+        for (slot, n) in kept.iter_mut().zip(self.notes().filter(|&n| n != note)) {
+            *slot = n;
+        }
+        self.notes = kept;
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -236,6 +278,10 @@ pub struct SequencerApp {
     rec_held: [Option<(u8, u8, u8, u64)>; 8],
     /// Per track: a step just recorded ahead of the playhead, not to be replayed on this pass.
     skip_once: [Option<u8>; TRACKS],
+    /// Last recorded step (track, step, time): notes landing on it within a step's time join it as a chord.
+    rec_step: Option<(u8, u8, u64)>,
+    /// A note pad has been tapped during the current step hold (the first tap replaces the chord, later ones add).
+    hold_notes_set: bool,
 }
 
 /// Microseconds since boot. Uses the system timer where embassy-time exists; the Launchpad S / Mini MK1 builds
@@ -363,6 +409,8 @@ impl SequencerApp {
             last_step_len_us: 125_000,
             rec_held: [None; 8],
             skip_once: [None; TRACKS],
+            rec_step: None,
+            hold_notes_set: false,
         }
     }
 
@@ -536,11 +584,13 @@ impl SequencerApp {
                 self.skip_once[t] = None;
             }
             if step.on && !muted && !skip && (step.prob >= 100 || self.random_percent() <= step.prob) {
-                let note = (step.note as i16 + transpose as i16).clamp(0, 127) as u8;
-                self.note_off_now(output, channel, note);
-                send(output, &[0x90 | channel, note, step.velocity]);
                 let gate_us = (step_us * step.gate.clamp(1, 8) as u64 / 8).saturating_sub(200).max(1000);
-                self.schedule_off(NoteOff { due_us: time + gate_us, output, channel, note });
+                for n in step.notes() {
+                    let note = (n as i16 + transpose as i16).clamp(0, 127) as u8;
+                    self.note_off_now(output, channel, note);
+                    send(output, &[0x90 | channel, note, step.velocity]);
+                    self.schedule_off(NoteOff { due_us: time + gate_us, output, channel, note });
+                }
             }
             let tr = &mut self.tracks[t];
             tr.playing_step = Some(pos as u8);
@@ -599,7 +649,18 @@ impl SequencerApp {
         // Early in the current step: it belongs to the step that just played; late: to the next one.
         let late = now.saturating_sub(self.last_step_us) >= self.last_step_len_us / 2;
         let step = if late { (last + 1) % len } else { last };
-        tr.pat_mut().steps[step as usize] = Step { on: true, note, velocity: velocity.clamp(1, 127), ..Step::OFF };
+        let velocity = velocity.clamp(1, 127);
+        let chord = matches!(self.rec_step, Some((rt, rs, at)) if rt == t as u8 && rs == step
+            && now.saturating_sub(at) < self.last_step_len_us.max(1));
+        let s = &mut tr.pat_mut().steps[step as usize];
+        if chord && s.on {
+            // Another note of a chord played on this step: add it.
+            s.add(note);
+            s.velocity = s.velocity.max(velocity);
+        } else {
+            *s = Step { velocity, ..Step::single(note) };
+        }
+        self.rec_step = Some((t as u8, step, now));
         if late {
             self.skip_once[t] = Some(step);
         }
@@ -619,7 +680,7 @@ impl SequencerApp {
                     *slot = None;
                     let gate = ((now.saturating_sub(start) * 8 + step_len / 2) / step_len).clamp(1, 8) as u8;
                     let s = &mut self.tracks[t as usize].pat_mut().steps[step as usize];
-                    if s.on && s.note == note {
+                    if s.on && s.has(note) {
                         s.gate = gate;
                     }
                 }
@@ -667,8 +728,9 @@ impl SequencerApp {
             let s = &mut track.pat_mut().steps[step];
             self.step_pending_off = s.on;
             self.step_edited = false;
+            self.hold_notes_set = false;
             if !s.on {
-                *s = Step { on: true, note, ..Step::OFF };
+                *s = Step::single(note);
             }
             self.held_step = Some(step as u8);
         }
@@ -690,8 +752,16 @@ impl SequencerApp {
         if pressed {
             if let Some(step) = self.held_step {
                 let s = &mut self.tracks[sel].pat_mut().steps[step as usize];
+                // First note pad in this hold sets the step's note; further ones toggle notes in its chord.
+                if !self.hold_notes_set {
+                    s.notes = Step::single(note).notes;
+                    self.hold_notes_set = true;
+                } else if s.has(note) {
+                    s.remove(note);
+                } else {
+                    s.add(note);
+                }
                 s.on = true;
-                s.note = note;
                 self.step_edited = true;
             }
             self.tracks[sel].note = note;
@@ -809,7 +879,7 @@ impl SequencerApp {
 
     // ---------------- projects ----------------
 
-    /// Streams the project body (everything before the CRC) to `sink`, in the version-2 layout.
+    /// Streams the project body (everything before the CRC) to `sink`, in the version-3 layout.
     fn emit(&self, sink: &mut dyn FnMut(&[u8])) {
         sink(&project::header(self.bpm, self.swing));
         for tr in self.tracks.iter() {
@@ -828,10 +898,12 @@ impl SequencerApp {
                 let mut b = [0u8; project::PATTERN_BYTES];
                 b[0] = pat.length;
                 for (i, st) in pat.steps.iter().enumerate() {
-                    b[1 + i * 4] = ((st.on as u8) << 7) | (st.note & 0x7f);
-                    b[2 + i * 4] = st.velocity;
-                    b[3 + i * 4] = st.gate;
-                    b[4 + i * 4] = st.prob;
+                    let o = 1 + i * project::STEP_BYTES;
+                    b[o] = ((st.on as u8) << 7) | (st.notes[0] & 0x7f);
+                    b[o + 1..o + MAX_NOTES].copy_from_slice(&st.notes[1..]);
+                    b[o + 4] = st.velocity;
+                    b[o + 5] = st.gate;
+                    b[o + 6] = st.prob;
                 }
                 sink(&b);
             }
@@ -847,8 +919,11 @@ impl SequencerApp {
     fn load_record(&mut self, rec: &[u8; project::RECORD]) {
         self.bpm = u16::from_le_bytes([rec[5], rec[6]]).clamp(30, 300);
         self.swing = rec[7].clamp(50, 75);
+        // Version 2 records have one note per step (4 bytes), version 3 up to four (7 bytes).
+        let v2 = rec[4] == 2;
+        let (step_bytes, pattern_bytes, track_bytes) = project::layout(rec[4]);
         for (t, tr) in self.tracks.iter_mut().enumerate() {
-            let base = project::HEADER + t * project::TRACK_BYTES;
+            let base = project::HEADER + t * track_bytes;
             let s = &rec[base..base + project::TRACK_SETTINGS];
             tr.channel = s[0] & 0x0f;
             tr.output = Output::ALL[(s[1] as usize).min(3)];
@@ -860,15 +935,24 @@ impl SequencerApp {
             tr.chain_end = (s[7] % PATTERNS as u8).max(tr.chain_start);
             tr.transpose = (s[8] as i8).clamp(-24, 24);
             for (p, pat) in tr.patterns.iter_mut().enumerate() {
-                let o = base + project::TRACK_SETTINGS + p * project::PATTERN_BYTES;
-                let b = &rec[o..o + project::PATTERN_BYTES];
+                let o = base + project::TRACK_SETTINGS + p * pattern_bytes;
+                let b = &rec[o..o + pattern_bytes];
                 pat.length = b[0].clamp(1, STEPS as u8);
                 for (i, st) in pat.steps.iter_mut().enumerate() {
-                    st.on = b[1 + i * 4] & 0x80 != 0;
-                    st.note = b[1 + i * 4] & 0x7f;
-                    st.velocity = b[2 + i * 4].clamp(1, 127);
-                    st.gate = b[3 + i * 4].clamp(1, 8);
-                    st.prob = b[4 + i * 4].clamp(1, 100);
+                    let s = &b[1 + i * step_bytes..1 + (i + 1) * step_bytes];
+                    st.on = s[0] & 0x80 != 0;
+                    st.notes = [s[0] & 0x7f, NO_NOTE, NO_NOTE, NO_NOTE];
+                    let rest = if v2 { &s[1..] } else {
+                        for (k, &n) in s[1..MAX_NOTES].iter().enumerate() {
+                            if n <= 127 {
+                                st.notes[1 + k] = n;
+                            }
+                        }
+                        &s[MAX_NOTES..]
+                    };
+                    st.velocity = rest[0].clamp(1, 127);
+                    st.gate = rest[1].clamp(1, 8);
+                    st.prob = rest[2].clamp(1, 100);
                 }
             }
             tr.queued = None;
@@ -893,7 +977,7 @@ impl SequencerApp {
             tr.base = b[5].min(96);
             for (i, st) in tr.patterns[0].steps.iter_mut().enumerate() {
                 st.on = b[6 + i * 2] & 0x80 != 0;
-                st.note = b[6 + i * 2] & 0x7f;
+                st.notes = Step::single(b[6 + i * 2] & 0x7f).notes;
                 st.velocity = b[7 + i * 2].clamp(1, 127);
             }
         }
@@ -1051,15 +1135,16 @@ impl SequencerApp {
                 };
                 led::set(step_index(step), c);
             }
-            let shown_note = match self.held_step {
-                Some(st) if pat.steps[st as usize].on => pat.steps[st as usize].note,
-                _ => track.note,
+            // Held lit step: all its chord notes; otherwise the note new steps get.
+            let shown = match self.held_step {
+                Some(st) if pat.steps[st as usize].on => pat.steps[st as usize].notes,
+                _ => Step::single(track.note).notes,
             };
             for pad in 0..32 {
                 let note = track.base as usize + pad;
                 let c = if note > 127 {
                     0
-                } else if note as u8 == shown_note {
+                } else if shown.contains(&(note as u8)) {
                     colour
                 } else if note % 12 == 0 {
                     0x303060
