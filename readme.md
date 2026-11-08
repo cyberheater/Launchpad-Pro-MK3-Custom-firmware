@@ -13,7 +13,7 @@
 > Please report problems with the sequencer here, not upstream.
 >
 > - User guide: [SEQUENCER_MANUAL.pdf](https://github.com/cyberheater/lpp-emu/blob/main/SEQUENCER_MANUAL.pdf)
-> - Firmware download: [releases](https://github.com/cyberheater/launchpad-core-firmware/releases)
+> - Firmware download: [releases](https://github.com/cyberheater/Launchpad-Pro-MK3-Custom-firmware/releases)
 > - Emulator and tests used to develop it: [cyberheater/lpp-emu](https://github.com/cyberheater/lpp-emu)
 
 > [!WARNING]
