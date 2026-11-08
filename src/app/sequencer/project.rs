@@ -11,7 +11,7 @@
 //   16   8 tracks x 2840 bytes:
 //          16 bytes settings: channel, output, muted, note, base, pattern, chain start, chain end, transpose (i8),
 //                             0 (was a test-build rate), step rate in half clock pulses per step
-//                             (0 in older projects = 1/16), 5 reserved
+//                             (0 in older projects = 1/16), solo, 4 reserved
 //          8 patterns x 353 bytes: length, then 32 steps x 11 bytes
 //                             (on << 7 | note 1, notes 2-8 (0xFF = none), velocity, gate in 8ths of a step (1-255), probability 1-100 %)
 //   22736 u32 CRC-32 (IEEE) of bytes 0..22736

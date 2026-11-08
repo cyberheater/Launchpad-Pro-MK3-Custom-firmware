@@ -11,7 +11,11 @@
 //   Grid rows 4..1   32 chromatic notes from the track's base note (row 1 = lowest). Tap = choose the note
 //                    new steps get, and preview it. Up / Down (80 / 70) move the note range by an octave.
 //   101-108          track select (the row under the grid).
-//   1-8              track mutes.
+//   Mute (2) / Solo (3)  arm a mode (the button flashes; press it again to disarm) in which the track buttons
+//                    mute / solo tracks at once. Shift + Mute / Solo: queued mode (flashes with white) - the change
+//                    waits until that track's pattern next starts from its first step (at once when stopped); the
+//                    track button flashes white meanwhile, and tapping it again cancels. With any track soloed only
+//                    soloed tracks play (a muted one stays silent). Solo is saved with the project.
 //   Hold a track button: steps 1-16 show/set its MIDI channel; note row 1 pads 1-4 set its output
 //                    (USB, DIN 1, DIN 2, DIN 1+2; new tracks start on DIN 1, channel = track number).
 //   Hold a step:     right-hand column = velocity bar (top = 127 ... bottom = 16), bottom row = gate length in
@@ -138,6 +142,18 @@ const RATE_PAD: usize = 16;
 /// The step area shows 32 steps at a time: page 1 = steps 1-32, page 2 = steps 33-64 (◀ / ▶ switch).
 const PAGE_STEPS: usize = 32;
 const BTN_LEFT: u8 = 91;
+/// Bottom row: Mute (2nd) and Solo (3rd) arm a mode in which the track buttons mute / solo tracks.
+const BTN_MUTE: u8 = 2;
+const BTN_SOLO: u8 = 3;
+
+/// What the track buttons do while Mute or Solo is armed. Queued = Shift + Mute / Solo: the change waits until the
+/// track's pattern next starts from its first step.
+#[derive(Copy, Clone, PartialEq)]
+enum Arm {
+    Off,
+    Mute { queued: bool },
+    Solo { queued: bool },
+}
 const BTN_RIGHT: u8 = 92;
 
 /// Step rate from track settings byte 10 (half pulses per step), or from byte 9 of the v0.2 test build (rate index
@@ -260,6 +276,11 @@ struct Track {
     channel: u8, // 0-15
     output: Output,
     muted: bool,
+    /// When any track is soloed, only soloed tracks play (a muted track stays silent).
+    solo: bool,
+    /// Queued mute / solo toggles (Shift + Mute / Solo), applied when the pattern next starts from its first step.
+    pending_mute: bool,
+    pending_solo: bool,
     note: u8, // note given to newly enabled steps
     base: u8, // lowest note of the note area
     transpose: i8,
@@ -284,6 +305,9 @@ impl Track {
             // New tracks play out of DIN 1 (the point of a standalone sequencer); change per track as needed.
             output: Output::Din1,
             muted: false,
+            solo: false,
+            pending_mute: false,
+            pending_solo: false,
             note: 60,
             base: 48,
             transpose: 0,
@@ -301,6 +325,18 @@ impl Track {
 
     fn pat_mut(&mut self) -> &mut Pattern {
         &mut self.patterns[self.pattern as usize % PATTERNS]
+    }
+
+    /// Applies queued mute / solo changes (at the start of the pattern, or at once when stopped).
+    fn apply_pending(&mut self) {
+        if self.pending_mute {
+            self.muted = !self.muted;
+        }
+        if self.pending_solo {
+            self.solo = !self.solo;
+        }
+        self.pending_mute = false;
+        self.pending_solo = false;
     }
 
     /// At the end of a pattern: take a queued pattern/chain, or move along the current chain.
@@ -343,6 +379,9 @@ pub struct SequencerApp {
     pending_half: Option<(u64, u64, u8)>,
     /// Step page shown: 0 = steps 1-32, 1 = steps 33-64.
     page: u8,
+    /// Mute / Solo mode for the track buttons, and the flash phase of the armed button (redrawn when it changes).
+    arm: Arm,
+    blink: bool,
     next_clock_us: u64,
     clock_count: u32,
     offs: [Option<NoteOff>; MAX_OFFS],
@@ -495,6 +534,8 @@ impl SequencerApp {
             pending_step: None,
             pending_half: None,
             page: 0,
+            arm: Arm::Off,
+            blink: false,
             next_clock_us: 0,
             clock_count: 0,
             offs: [None; MAX_OFFS],
@@ -562,6 +603,7 @@ impl SequencerApp {
             t.pattern = t.chain_start;
             t.position = 0;
             t.playing_step = None;
+            t.apply_pending();
         }
         self.rng ^= now_us() as u32;
         self.clock_count = 0;
@@ -767,6 +809,7 @@ impl SequencerApp {
 
     /// Plays the next step of every track running at `rate`.
     fn play_step(&mut self, time: u64, step_us: u64, rate: u8) {
+        let any_solo = self.tracks.iter().any(|t| t.solo);
         for t in 0..TRACKS {
             if self.tracks[t].rate != rate {
                 continue;
@@ -776,7 +819,7 @@ impl SequencerApp {
                 tr.last_step_us = time;
                 tr.step_len_us = step_us;
                 let pos = tr.position as usize % STEPS;
-                (pos, tr.pat().steps[pos], tr.muted, tr.output, tr.channel, tr.transpose)
+                (pos, tr.pat().steps[pos], tr.muted || (any_solo && !tr.solo), tr.output, tr.channel, tr.transpose)
             };
             let skip = self.skip_once[t] == Some(pos as u8);
             if skip {
@@ -797,6 +840,7 @@ impl SequencerApp {
             tr.position = ((pos + 1) % len) as u8;
             if tr.position == 0 {
                 tr.next_pattern();
+                tr.apply_pending();
             }
         }
         self.dirty = true;
@@ -1066,6 +1110,21 @@ impl SequencerApp {
         self.dirty = true;
     }
 
+    /// A track button tapped while Mute or Solo is armed: toggle it now, or queue the toggle for the start of the
+    /// track's pattern (Shift + Mute / Solo; at once when stopped). Tapping a queued track again cancels it.
+    fn mute_solo_tap(&mut self, t: usize) {
+        let playing = self.playing;
+        let tr = &mut self.tracks[t];
+        match self.arm {
+            Arm::Mute { queued: true } if playing => tr.pending_mute = !tr.pending_mute,
+            Arm::Solo { queued: true } if playing => tr.pending_solo = !tr.pending_solo,
+            Arm::Mute { .. } => tr.muted = !tr.muted,
+            Arm::Solo { .. } => tr.solo = !tr.solo,
+            Arm::Off => {}
+        }
+        self.dirty = true;
+    }
+
     fn on_track_button(&mut self, t: usize, pressed: bool) {
         if pressed {
             if self.clear {
@@ -1201,6 +1260,7 @@ impl SequencerApp {
             s[0] = tr.channel;
             s[1] = Output::ALL.iter().position(|o| *o == tr.output).unwrap_or(0) as u8;
             s[2] = tr.muted as u8;
+            s[11] = tr.solo as u8;
             s[3] = tr.note;
             s[4] = tr.base;
             s[5] = tr.pattern;
@@ -1248,6 +1308,9 @@ impl SequencerApp {
             tr.channel = s[0] & 0x0f;
             tr.output = Output::ALL[(s[1] as usize).min(3)];
             tr.muted = s[2] != 0;
+            tr.solo = s[11] != 0;
+            tr.pending_mute = false;
+            tr.pending_solo = false;
             tr.note = s[3] & 0x7f;
             tr.base = s[4].min(96);
             tr.pattern = s[5] % PATTERNS as u8;
@@ -1497,19 +1560,49 @@ impl SequencerApp {
             }
         }
 
+        // Track row. Mute armed: unmuted tracks in their colour, muted ones dark red. Solo armed: soloed tracks in
+        // their colour, others dark. A queued change flashes white. Otherwise: selected track bright, others dim, and
+        // tracks silenced by mute or solo darker still.
+        let any_solo = self.tracks.iter().any(|t| t.solo);
         for t in 0..TRACKS {
             let tc = TRACK_COLOURS[t];
+            let tr = &self.tracks[t];
+            let pending = match self.arm {
+                Arm::Solo { .. } => tr.pending_solo,
+                _ => tr.pending_mute,
+            };
             let track_led = if self.projects_held {
                 if t == self.slot { 0xFFFFFF } else if self.slot_saved[t] { 0x303030 } else { 0 }
+            } else if pending && self.blink {
+                0xFFFFFF
+            } else if let Arm::Mute { .. } = self.arm {
+                if tr.muted { 0x300000 } else { tc }
+            } else if let Arm::Solo { .. } = self.arm {
+                if tr.solo { tc } else { 0x080808 }
             } else if t == sel {
                 tc
+            } else if tr.muted || (any_solo && !tr.solo) {
+                dim(tc, 6)
             } else {
                 dim(tc, 3)
             };
             led::set(101 + t as u8, track_led);
-            let tr = &self.tracks[t];
-            let playing_note = self.playing && tr.playing_step.map_or(false, |p| tr.pat().steps[p as usize].on);
-            led::set(1 + t as u8, if tr.muted { 0x300000 } else if playing_note { 0x40FF40 } else { 0x084008 });
+        }
+        // Bottom row: Mute (red) and Solo (blue) flash while armed (queued mode alternates with white); dim otherwise.
+        let flash = |on: u32, queued: bool| if self.blink { on } else if queued { 0xFFFFFF } else { dim(on, 4) };
+        for n in 1..=8u8 {
+            let c = match n {
+                BTN_MUTE => match self.arm {
+                    Arm::Mute { queued } => flash(0xFF0000, queued),
+                    _ => 0x300000,
+                },
+                BTN_SOLO => match self.arm {
+                    Arm::Solo { queued } => flash(0x0060FF, queued),
+                    _ => 0x000830,
+                },
+                _ => 0,
+            };
+            led::set(n, c);
         }
         if self.shift {
             // Sends/Tap: white for a moment after a tap, amber otherwise.
@@ -1622,6 +1715,7 @@ impl App for SequencerApp {
         self.clear = false;
         self.duplicate = false;
         self.fixed_length = false;
+        self.arm = Arm::Off;
     }
 
     fn on_surface(&mut self, event: SurfaceEvent) {
@@ -1636,6 +1730,10 @@ impl App for SequencerApp {
             if event.pressed {
                 self.projects_used = true;
                 self.load_slot((i - 101) as usize, true);
+            }
+        } else if let (true, false) = ((101..=108).contains(&i), self.arm == Arm::Off) {
+            if event.pressed {
+                self.mute_solo_tap((i - 101) as usize);
             }
         } else if (101..=108).contains(&i) {
             self.on_track_button((i - 101) as usize, event.pressed);
@@ -1661,12 +1759,18 @@ impl App for SequencerApp {
             if event.pressed {
                 self.tap();
             }
-        } else if (1..=8).contains(&i) {
+        } else if i == BTN_MUTE || i == BTN_SOLO {
             if event.pressed {
-                let t = &mut self.tracks[(i - 1) as usize];
-                t.muted = !t.muted;
+                let queued = self.shift;
+                self.arm = match (i == BTN_MUTE, self.arm) {
+                    (true, Arm::Mute { .. }) | (false, Arm::Solo { .. }) => Arm::Off,
+                    (true, _) => Arm::Mute { queued },
+                    (false, _) => Arm::Solo { queued },
+                };
                 self.dirty = true;
             }
+        } else if (1..=8).contains(&i) {
+            // The other bottom-row buttons have no function here (Sends = tap tempo with Shift, handled above).
         } else {
             match i {
                 BTN_SHIFT => {
@@ -1754,6 +1858,12 @@ impl App for SequencerApp {
 
     fn on_tick(&mut self) {
         self.run_engine();
+        let blink = (now_us() / 250_000) % 2 == 0;
+        let pending = self.tracks.iter().any(|t| t.pending_mute || t.pending_solo);
+        if blink != self.blink && (self.arm != Arm::Off || pending) {
+            self.blink = blink;
+            self.dirty = true;
+        }
         if self.dirty {
             self.draw();
         }
