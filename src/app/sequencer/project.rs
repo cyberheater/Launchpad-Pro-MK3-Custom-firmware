@@ -7,9 +7,10 @@
 //        external clock), 7 reserved                                       = 16 bytes
 //   16   8 tracks x 2840 bytes:
 //          16 bytes settings: channel, output, muted, note, base, pattern, chain start, chain end, transpose (i8),
-//                             step rate + 1 (0 in older projects = 1/16), 6 reserved
+//                             0 (was a test-build rate), step rate in half clock pulses per step
+//                             (0 in older projects = 1/16), 5 reserved
 //          8 patterns x 353 bytes: length, then 32 steps x 11 bytes
-//                             (on << 7 | note 1, notes 2-8 (0xFF = none), velocity, gate 1-8, probability 1-100 %)
+//                             (on << 7 | note 1, notes 2-8 (0xFF = none), velocity, gate in 8ths of a step (1-255), probability 1-100 %)
 //   22736 u32 CRC-32 (IEEE) of bytes 0..22736
 // Versions 3 and 2 (read): 8 slots of 16 KB at V2_BASE, same layout with 4 notes (7-byte steps) or 1 note
 //   (4-byte steps: on << 7 | note, velocity, gate, prob). A slot with a valid v4 record wins over its old copy.

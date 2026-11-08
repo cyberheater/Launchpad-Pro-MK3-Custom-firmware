@@ -13,7 +13,7 @@
 //   Hold a track button: steps 1-16 show/set its MIDI channel; note row 1 pads 1-4 set its output
 //                    (USB, DIN 1, DIN 2, DIN 1+2; new tracks start on DIN 1, channel = track number).
 //   Hold a step:     right-hand column = velocity bar (top = 127 ... bottom = 16), bottom row = gate length in
-//                    eighths of a step (1 = shortest, 8 = whole step); a lit step tapped and released without an edit
+//                    eighths of a step (1 = shortest, 8 = whole step; a longer recorded note shows all 8); a lit step tapped and released without an edit
 //                    turns off. Step brightness follows velocity.
 //   Patterns (89)    hold: the grid shows 8 patterns (rows, A = top) for each of the 8 tracks (columns): current =
 //                    track colour, chained = medium, has notes = dim, queued = white. Tap a pattern to switch to it
@@ -23,8 +23,8 @@
 //   Hold Shift:      step pads show swing (pad 1 = 50 % straight ... pad 26 = 75 %); tap one to set it.
 //   Hold a step + Shift: right-hand column = probability bar (top = 100 % ... bottom = 12 %).
 //   Hold a track button: note rows 2-4 = transpose (-12 ... +11 semitones; the dim pad is 0); steps 17-24 = step
-//                    rate: 1/32, 1/16T, 1/16 (default), 1/8T, 1/8, 1/4T, 1/4, 1/2 (green = straight, purple =
-//                    triplet). Swing only applies to 1/16 tracks; other rates play straight.
+//                    rate, slowest left: 1/1, 1/4, 1/4T, 1/8, 1/8T, 1/16 (default), 1/16T, 1/32 (green = straight,
+//                    purple = triplet). Swing only applies to 1/16 tracks; other rates play straight.
 //   Play (20)        start / stop.        Shift (90) + Up / Down: tempo +1 / -1 BPM (+10 / -10 with Fixed Length held).
 //   Shift held:      the note area shows the tempo (orange bar = hundreds, then tens and units in white), and the
 //                    Sends button (its printed Shift label is "Tap") is tap tempo: tap it in time; the average of the
@@ -34,8 +34,8 @@
 //   Note (94)        back to the note/performance app; playback continues there (Sequencer button lit green).
 //   Record (10)      tap: arm / disarm live recording (red). While armed and playing, notes played on the note pads or
 //                    arriving on the USB MIDI port / DIN In (e.g. a keyboard) are written into the selected track's
-//                    current pattern at the nearest step, with their velocity and held length as the gate (up to one
-//                    step). A note recorded just ahead of a step is not replayed on that pass (you already heard it).
+//                    current pattern at the nearest step, with their velocity and held length as the gate (a note held
+//                    over several steps keeps sounding for as long as it was held). A note recorded just ahead of a step is not replayed on that pass (you already heard it).
 //                    Notes played together land on the same step as a chord (up to 8; loudest velocity kept).
 //   MIDI thru        a keyboard on the USB MIDI port / DIN In plays the selected track: notes, aftertouch, controllers,
 //                    program change and pitch bend are re-sent on that track's output and channel. Echoes from a
@@ -123,11 +123,30 @@ const VELOCITY_LEVELS: [u8; 8] = [127, 112, 96, 80, 64, 48, 32, 16];
 const PROB_LEVELS: [u8; 8] = [100, 87, 75, 62, 50, 37, 25, 12];
 /// Transpose pads: note pad index - TRANSPOSE_ZERO_PAD = semitones (pads 8-31 -> -12 ... +11).
 const TRANSPOSE_ZERO_PAD: i8 = 20;
-/// Per-track step rates, in 24 PPQN clock pulses per step, fastest first (step pads 17-24 while a track button is
-/// held): 1/32, 1/16 triplet, 1/16, 1/8 triplet, 1/8, 1/4 triplet, 1/4, 1/2.
-const RATE_PULSES: [u32; 8] = [3, 4, 6, 8, 12, 16, 24, 48];
-const DEFAULT_RATE: u8 = 2;
+/// Per-track step rates, in half clock pulses (24 PPQN) per step, slowest first (step pads 17-24 while a track
+/// button is held): 1/1, 1/4, 1/4 triplet, 1/8, 1/8 triplet, 1/16, 1/16 triplet, 1/32. Triplets are the ones not
+/// divisible by 3.
+const RATE_HALF_PULSES: [u32; 8] = [192, 48, 32, 24, 16, 12, 8, 6];
+const DEFAULT_RATE: u8 = 5;
+/// Longest gate, in eighths of a step (recorded notes held over several steps).
+const MAX_GATE: u8 = 255;
 const RATE_PAD: usize = 16;
+
+/// Step rate from track settings byte 10 (half pulses per step), or from byte 9 of the v0.2 test build (rate index
+/// + 1 in the old order 1/32, 1/16T, 1/16, 1/8T, 1/8, 1/4T, 1/4, 1/2; 1/2 becomes 1/1).
+fn rate_from_saved(half_pulses: u8, old: u8) -> u8 {
+    const OLD_HALF_PULSES: [u8; 8] = [6, 8, 12, 16, 24, 32, 48, 96];
+    let hp = match (half_pulses, old) {
+        (0, o @ 1..=8) => OLD_HALF_PULSES[o as usize - 1],
+        (h, _) => h,
+    };
+    match RATE_HALF_PULSES.iter().position(|&r| r == hp as u32) {
+        Some(i) => i as u8,
+        None if hp < 6 => (RATE_HALF_PULSES.len() - 1) as u8, // 1/64 of an earlier test build
+        None if hp == 96 => 0,
+        None => DEFAULT_RATE,
+    }
+}
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum Output {
@@ -233,7 +252,7 @@ struct Track {
     transpose: i8,
     position: u8, // next step to play
     playing_step: Option<u8>,
-    /// Step rate: index into RATE_PULSES (DEFAULT_RATE = 16ths).
+    /// Step rate: index into RATE_HALF_PULSES (DEFAULT_RATE = 16ths).
     rate: u8,
     /// Time and length of the track's last played step (for quantising recorded notes).
     last_step_us: u64,
@@ -307,6 +326,8 @@ pub struct SequencerApp {
     rng: u32,
     /// Swung odd 16th waiting for its time: (due, step length).
     pending_step: Option<(u64, u64)>,
+    /// A step of a non-16th rate due between two clock pulses: (due, step length, rate).
+    pending_half: Option<(u64, u64, u8)>,
     next_clock_us: u64,
     clock_count: u32,
     offs: [Option<NoteOff>; MAX_OFFS],
@@ -347,6 +368,9 @@ pub struct SequencerApp {
     record_armed: bool,
     /// Notes being recorded, waiting for their note-off: (note, track, step, start time).
     rec_held: [Option<(u8, u8, u8, u64)>; 8],
+    /// Time of the last clock pulse and the interval it ran at (to measure recorded note lengths in pulses).
+    last_pulse_us: u64,
+    pulse_interval_us: u64,
     /// Per track: a step just recorded ahead of the playhead, not to be replayed on this pass.
     skip_once: [Option<u8>; TRACKS],
     /// Last recorded step (track, step, time): notes landing on it within a step's time join it as a chord.
@@ -453,6 +477,7 @@ impl SequencerApp {
             swing: 50,
             rng: 0x1234_5678,
             pending_step: None,
+            pending_half: None,
             next_clock_us: 0,
             clock_count: 0,
             offs: [None; MAX_OFFS],
@@ -485,6 +510,8 @@ impl SequencerApp {
             taps: [0; TAP_HISTORY],
             record_armed: false,
             rec_held: [None; 8],
+            last_pulse_us: 0,
+            pulse_interval_us: 20_833,
             skip_once: [None; TRACKS],
             rec_step: None,
             hold_notes_set: false,
@@ -635,6 +662,7 @@ impl SequencerApp {
         self.rec_held = [None; 8];
         self.skip_once = [None; TRACKS];
         self.pending_step = None;
+        self.pending_half = None;
         self.stop_notes();
         for t in self.tracks.iter_mut() {
             t.playing_step = None;
@@ -645,7 +673,7 @@ impl SequencerApp {
 
     /// One clock pulse (24 PPQN). Tracks at the default 16th rate: even 16ths play on pulse 0 of their 8th-note pair;
     /// odd 16ths are due at pulse 6, delayed by swing (50 % = straight, 75 % = triplet-ish), timed to the millisecond
-    /// rather than to whole pulses. Tracks at other rates play straight, every RATE_PULSES pulses from the start.
+    /// rather than to whole pulses. Tracks at other rates play straight.
     fn pulse(&mut self, now: u64, interval: u64) {
         let count = self.clock_count;
         let in_pair = count % 12;
@@ -664,12 +692,33 @@ impl SequencerApp {
                 self.pending_step = Some((now + swing_us, len));
             }
         }
-        for (r, &p) in RATE_PULSES.iter().enumerate() {
-            if r as u8 != DEFAULT_RATE && count % p == 0 {
-                self.play_step(now, interval * p as u64, r as u8);
+        // Other rates, straight. A step is due every `hp` half-pulses from the start; one landing half way between
+        // two pulses (1/64 = 1.5 pulses) is timed half a clock interval after this pulse.
+        if let Some((due, len, r)) = self.pending_half.take() {
+            self.play_step(due.min(now), len, r);
+        }
+        let half = 2 * count as u64;
+        for (r, &hp) in RATE_HALF_PULSES.iter().enumerate() {
+            if r as u8 == DEFAULT_RATE {
+                continue;
+            }
+            let hp = hp as u64;
+            let len = interval * hp / 2;
+            if half % hp == 0 {
+                self.play_step(now, len, r as u8);
+            } else if (half + 1) % hp == 0 {
+                self.pending_half = Some((now + interval / 2, len, r as u8));
             }
         }
         self.clock_count = count.wrapping_add(1);
+        self.last_pulse_us = now;
+        self.pulse_interval_us = interval.max(1);
+    }
+
+    /// Clock position in 1/256ths of a pulse: pulses so far plus how far we are towards the next one.
+    fn clock_pos(&self, now: u64) -> u64 {
+        let frac = (now.saturating_sub(self.last_pulse_us) * 256 / self.pulse_interval_us).min(255);
+        self.clock_count as u64 * 256 + frac
     }
 
     fn run_clock(&mut self, now: u64) {
@@ -717,7 +766,7 @@ impl SequencerApp {
                 self.skip_once[t] = None;
             }
             if step.on && !muted && !skip && (step.prob >= 100 || self.random_percent() <= step.prob) {
-                let gate_us = (step_us * step.gate.clamp(1, 8) as u64 / 8).saturating_sub(200).max(1000);
+                let gate_us = (step_us * step.gate.max(1) as u64 / 8).saturating_sub(200).max(1000);
                 for n in step.notes() {
                     let note = (n as i16 + transpose as i16).clamp(0, 127) as u8;
                     self.note_off_now(output, channel, note);
@@ -798,21 +847,25 @@ impl SequencerApp {
         if late {
             self.skip_once[t] = Some(step);
         }
+        let pos = self.clock_pos(now);
         if let Some(slot) = self.rec_held.iter_mut().find(|s| s.is_none()) {
-            *slot = Some((note, t as u8, step, now));
+            *slot = Some((note, t as u8, step, pos));
         }
         self.dirty = true;
     }
 
-    /// Note released: its held length becomes the gate (in eighths of a step, 1-8).
+    /// Note released: its held length becomes the gate, in eighths of a step: 1 up to MAX_GATE (about 32 steps), so a
+    /// held note can last over several steps.
     fn record_note_off(&mut self, note: u8) {
-        let now = now_us();
+        let pos = self.clock_pos(now_us());
         for slot in self.rec_held.iter_mut() {
             if let Some((n, t, step, start)) = *slot {
                 if n == note {
                     *slot = None;
-                    let step_len = self.tracks[t as usize].step_len_us.max(1);
-                    let gate = ((now.saturating_sub(start) * 8 + step_len / 2) / step_len).clamp(1, 8) as u8;
+                    // Held length in clock pulses (exact whatever the tempo or clock source), in eighths of a step.
+                    let step_256ths = RATE_HALF_PULSES[self.tracks[t as usize].rate as usize] as u64 * 128;
+                    let held = pos.saturating_sub(start) * 8;
+                    let gate = ((held + step_256ths / 2) / step_256ths).clamp(1, MAX_GATE as u64) as u8;
                     let s = &mut self.tracks[t as usize].pat_mut().steps[step as usize];
                     if s.on && s.has(note) {
                         s.gate = gate;
@@ -903,7 +956,7 @@ impl SequencerApp {
         if let Some(t) = self.held_track {
             if step < 16 {
                 self.tracks[t].channel = step as u8;
-            } else if (RATE_PAD..RATE_PAD + RATE_PULSES.len()).contains(&step) {
+            } else if (RATE_PAD..RATE_PAD + RATE_HALF_PULSES.len()).contains(&step) {
                 self.tracks[t].rate = (step - RATE_PAD) as u8;
             }
             self.dirty = true;
@@ -1086,6 +1139,14 @@ impl SequencerApp {
                 self.play_step(due, len, DEFAULT_RATE);
             }
         }
+        if let Some((due, len, r)) = self.pending_half {
+            if !self.playing {
+                self.pending_half = None;
+            } else if now >= due {
+                self.pending_half = None;
+                self.play_step(due, len, r);
+            }
+        }
         self.run_note_offs(now);
         if self.save_flash_until != 0 && now >= self.save_flash_until {
             self.save_flash_until = 0;
@@ -1113,7 +1174,9 @@ impl SequencerApp {
             s[6] = tr.chain_start;
             s[7] = tr.chain_end;
             s[8] = tr.transpose as u8;
-            s[9] = tr.rate + 1; // 0 in older projects = the default 16ths
+            // Step rate as half clock pulses per step (0 in older projects = the default 16ths). Byte 9 held the
+            // first, fastest-first rate index of the v0.2 test build; it is now always 0.
+            s[10] = RATE_HALF_PULSES[tr.rate as usize % RATE_HALF_PULSES.len()] as u8;
             sink(&s);
             for pat in tr.patterns.iter() {
                 let mut b = [0u8; project::PATTERN_BYTES];
@@ -1158,10 +1221,7 @@ impl SequencerApp {
             tr.chain_start = s[6] % PATTERNS as u8;
             tr.chain_end = (s[7] % PATTERNS as u8).max(tr.chain_start);
             tr.transpose = (s[8] as i8).clamp(-24, 24);
-            tr.rate = match s[9] {
-                r @ 1..=8 => r - 1,
-                _ => DEFAULT_RATE,
-            };
+            tr.rate = rate_from_saved(s[10], s[9]);
             for (p, pat) in tr.patterns.iter_mut().enumerate() {
                 let o = base + project::TRACK_SETTINGS + p * pattern_bytes;
                 let b = &rec[o..o + pattern_bytes];
@@ -1177,7 +1237,7 @@ impl SequencerApp {
                     }
                     let rest = &s[stored_notes..];
                     st.velocity = rest[0].clamp(1, 127);
-                    st.gate = rest[1].clamp(1, 8);
+                    st.gate = rest[1].max(1);
                     st.prob = rest[2].clamp(1, 100);
                 }
             }
@@ -1315,10 +1375,10 @@ impl SequencerApp {
             for step in 0..STEPS {
                 let c = if step < 16 {
                     if step as u8 == self.tracks[t].channel { 0xFFFFFF } else { 0x101010 }
-                } else if (RATE_PAD..RATE_PAD + RATE_PULSES.len()).contains(&step) {
+                } else if (RATE_PAD..RATE_PAD + RATE_HALF_PULSES.len()).contains(&step) {
                     let r = (step - RATE_PAD) as u8;
                     // Straight rates green, triplets purple; the default (1/16) a little brighter when not chosen.
-                    let triplet = RATE_PULSES[r as usize] % 3 != 0; // 4, 8, 16 pulses
+                    let triplet = RATE_HALF_PULSES[r as usize] % 3 != 0;
                     let on = if triplet { 0xA040FF } else { 0x20FF40 };
                     if r == self.tracks[t].rate {
                         on
