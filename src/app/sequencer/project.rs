@@ -3,7 +3,8 @@
 // Sequencer project storage in the driver's user storage area.
 //
 // Version 4 (current): 8 slots of 32 KB at V4_BASE; the last-used-slot record stays at META_OFFSET.
-//   0    "LPS2", u8 version 4, u16 bpm, u8 swing (50-75 %), 8 reserved      = 16 bytes
+//   0    "LPS2", u8 version 4, u16 bpm, u8 swing (50-75 %), u8 flags (bit 0 = ignore
+//        external clock), 7 reserved                                       = 16 bytes
 //   16   8 tracks x 2840 bytes:
 //          16 bytes settings: channel, output, muted, note, base, pattern, chain start, chain end, transpose (i8),
 //                             7 reserved
@@ -126,12 +127,16 @@ pub fn available() -> bool {
     driver::user_storage_size() >= V4_BASE + SLOTS as u32 * SLOT_SIZE
 }
 
-pub fn header(bpm: u16, swing: u8) -> [u8; HEADER] {
+/// Header byte 8, bit 0: ignore an external MIDI clock (0 in older projects = follow it).
+pub const FLAG_IGNORE_CLOCK: u8 = 0x01;
+
+pub fn header(bpm: u16, swing: u8, flags: u8) -> [u8; HEADER] {
     let mut h = [0u8; HEADER];
     h[0..4].copy_from_slice(&MAGIC);
     h[4] = VERSION;
     h[5..7].copy_from_slice(&bpm.to_le_bytes());
     h[7] = swing;
+    h[8] = flags;
     h
 }
 

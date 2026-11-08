@@ -46,6 +46,8 @@
 // Timing: a 24 PPQN clock derived from the system timer (not from tick counting), or an external MIDI clock
 // (USB MIDI port / DIN In: FA start, FB continue, FC stop, F8 pulses; clock passed on to both DIN outs; Play LED
 // cyan while following; back to internal 500 ms after the last pulse). One step = a 16th note = 6 clock pulses.
+// Shift + Play toggles following an external clock (while Shift is held, Play is cyan = follow, orange = ignore
+// incoming clock / start / stop and always use the internal tempo); the setting is saved with the project.
 // MIDI clock / start / stop go to USB and both DIN outputs.
 
 use crate::app::apptrait::App;
@@ -320,6 +322,8 @@ pub struct SequencerApp {
     ext_active: bool,
     ext_last_pulse_us: u64,
     ext_interval_us: u64,
+    /// Ignore incoming MIDI clock / start / stop (Shift + Play toggles; saved with the project).
+    ext_ignore: bool,
     /// When we last sent F8 / FA / FB / FC: the same byte arriving within RT_ECHO_US of that is our own echo.
     rt_sent_us: core::cell::Cell<[u64; 4]>,
     /// Tap tempo (Shift + Sends/Tap): times of the recent taps, newest last; 0 = none.
@@ -464,6 +468,7 @@ impl SequencerApp {
             ext_active: false,
             ext_last_pulse_us: 0,
             ext_interval_us: 20_833,
+            ext_ignore: false,
             rt_sent_us: core::cell::Cell::new([0; 4]),
             taps: [0; TAP_HISTORY],
             record_armed: false,
@@ -548,6 +553,9 @@ impl SequencerApp {
     /// pulses are >= 8 ms apart even at 300 BPM, and a real external clock that is ignored once soon takes over.)
     pub fn on_realtime(&mut self, status: u8) {
         const RT_ECHO_US: u64 = 6_000;
+        if self.ext_ignore {
+            return;
+        }
         let now = now_us();
         if let Some(i) = Self::rt_index(status) {
             if now.saturating_sub(self.rt_sent_us.get()[i]) < RT_ECHO_US {
@@ -591,6 +599,17 @@ impl SequencerApp {
             }
             _ => {}
         }
+    }
+
+    /// Shift + Play: follow / ignore an external MIDI clock. Turning it off while following carries on at once with
+    /// the internal clock at the current BPM.
+    fn toggle_ext_ignore(&mut self) {
+        self.ext_ignore = !self.ext_ignore;
+        if self.ext_ignore && self.ext_active {
+            self.ext_active = false;
+            self.next_clock_us = now_us();
+        }
+        self.dirty = true;
     }
 
     fn stop_notes(&mut self) {
@@ -1058,7 +1077,7 @@ impl SequencerApp {
 
     /// Streams the project body (everything before the CRC) to `sink`, in the current (version-4) layout.
     fn emit(&self, sink: &mut dyn FnMut(&[u8])) {
-        sink(&project::header(self.bpm, self.swing));
+        sink(&project::header(self.bpm, self.swing, if self.ext_ignore { project::FLAG_IGNORE_CLOCK } else { 0 }));
         for tr in self.tracks.iter() {
             let mut s = [0u8; project::TRACK_SETTINGS];
             s[0] = tr.channel;
@@ -1096,6 +1115,10 @@ impl SequencerApp {
     fn load_record(&mut self, rec: &[u8; project::RECORD]) {
         self.bpm = u16::from_le_bytes([rec[5], rec[6]]).clamp(30, 300);
         self.swing = rec[7].clamp(50, 75);
+        self.ext_ignore = rec[8] & project::FLAG_IGNORE_CLOCK != 0;
+        if self.ext_ignore {
+            self.ext_active = false;
+        }
         // Notes stored per step: 1 in version 2, 4 in version 3, 8 in version 4.
         let (step_bytes, pattern_bytes, track_bytes, stored_notes) = project::layout(rec[4]);
         for (t, tr) in self.tracks.iter_mut().enumerate() {
@@ -1139,6 +1162,7 @@ impl SequencerApp {
     fn load_v1(&mut self, rec: &[u8; project::V1_RECORD]) {
         self.bpm = u16::from_le_bytes([rec[5], rec[6]]).clamp(30, 300);
         self.swing = 50;
+        self.ext_ignore = false;
         for (t, tr) in self.tracks.iter_mut().enumerate() {
             let b = &rec[8 + t * project::V1_TRACK_BYTES..8 + (t + 1) * project::V1_TRACK_BYTES];
             *tr = Track::new(t as u8);
@@ -1380,7 +1404,17 @@ impl SequencerApp {
 
         let beat = self.playing && (self.clock_count.wrapping_sub(1) / 24) % 4 == 0;
         let (on, off) = if self.ext_active { (0x40FFFF, 0x106060) } else { (0x40FF40, 0x106010) };
-        led::set(BTN_PLAY, if self.playing { if beat { on } else { off } } else if self.ext_active { 0x103030 } else { 0x101010 });
+        let play = if self.shift && held_step.is_none() {
+            // Shift held: Play shows the clock-follow setting (cyan = follows external clock, orange = ignores it).
+            if self.ext_ignore { 0xFF6000 } else { 0x00C0C0 }
+        } else if self.playing {
+            if beat { on } else { off }
+        } else if self.ext_active {
+            0x103030
+        } else {
+            0x101010
+        };
+        led::set(BTN_PLAY, play);
         led::set(BTN_SEQUENCER, 0xFFFFFF);
         led::set(BTN_NOTE_MODE, 0x202020);
         led::set(BTN_UP, 0x202020);
@@ -1503,6 +1537,7 @@ impl App for SequencerApp {
                     self.record_armed = !self.record_armed;
                     self.dirty = true;
                 }
+                BTN_PLAY if event.pressed && self.shift => self.toggle_ext_ignore(),
                 BTN_PLAY if event.pressed => {
                     if self.playing { self.stop() } else { self.start() }
                 }
