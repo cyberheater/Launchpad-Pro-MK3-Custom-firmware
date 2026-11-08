@@ -4,6 +4,37 @@
   </a>
 </div>
 
+> [!IMPORTANT]
+> **This is a fork: CoreFW with an 8-track standalone MIDI step sequencer for the Launchpad Pro MK3**
+> (branch `lppmk3-sequencer`). Changes from upstream: the sequencer in `src/app/sequencer/`, Pro MK3 DIN MIDI
+> (`src/sys/driver/launchpad-pro-mk3/din.rs`), external-flash project storage and small hooks in the app host and
+> drivers; see the git history for every change.
+> Original CoreFW by Anthony Hofmeister: [anthonyhfm/launchpad-core-firmware](https://github.com/anthonyhfm/launchpad-core-firmware).
+> Please report problems with the sequencer here, not upstream.
+>
+> - User guide: [SEQUENCER_MANUAL.pdf](https://github.com/cyberheater/lpp-emu/blob/main/SEQUENCER_MANUAL.pdf)
+> - Firmware download: [releases](https://github.com/cyberheater/launchpad-core-firmware/releases)
+> - Emulator and tests used to develop it: [cyberheater/lpp-emu](https://github.com/cyberheater/lpp-emu)
+
+> [!WARNING]
+> **Early beta.** The sequencer firmware has been tested on very few devices. Flashing custom firmware onto your own
+> Launchpad is entirely at your own risk: it may misbehave or lose your projects and settings, and an interrupted or
+> failed update can leave the Launchpad needing recovery from the bootloader. The authors accept no responsibility
+> for damage to your device or data.
+
+### Flashing the sequencer (Launchpad Pro MK3)
+
+1. Download the latest `.syx` from the [releases page](../../releases), or build it: `cargo lppmk3`
+   (makes `build/lppmk3/fw.syx`).
+2. Unplug the Launchpad, hold **Setup**, and plug the USB cable back in while holding it. A MIDI port with
+   "Bootloader" in its name appears.
+3. Send the file: `python3 tools/flash.py <file>.syx` (needs `pip install mido python-rtmidi`), or use any SysEx
+   tool (SysEx Librarian on macOS, MIDI-OX on Windows). Do not unplug while it is sending.
+4. The Launchpad restarts; press **Sequencer** to open it. To go back to the original firmware, enter bootloader
+   mode the same way and update with Novation Components.
+
+---
+
 CoreFW is a full reimplementation of the firmware for the Novation Launchpad device series. Originally, it was a reverse engineering and binary injection project (`launchpad-injection-cfw`). It now supports all RGB and non-RGB Launchpads with accessible bootloaders.
 
 > [!NOTE]
