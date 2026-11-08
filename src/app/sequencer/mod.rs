@@ -22,7 +22,9 @@
 //                    + Clear held: clear that pattern.
 //   Hold Shift:      step pads show swing (pad 1 = 50 % straight ... pad 26 = 75 %); tap one to set it.
 //   Hold a step + Shift: right-hand column = probability bar (top = 100 % ... bottom = 12 %).
-//   Hold a track button: note rows 2-4 = transpose (-12 ... +11 semitones; the dim pad is 0).
+//   Hold a track button: note rows 2-4 = transpose (-12 ... +11 semitones; the dim pad is 0); steps 17-24 = step
+//                    rate: 1/32, 1/16T, 1/16 (default), 1/8T, 1/8, 1/4T, 1/4, 1/2 (green = straight, purple =
+//                    triplet). Swing only applies to 1/16 tracks; other rates play straight.
 //   Play (20)        start / stop.        Shift (90) + Up / Down: tempo +1 / -1 BPM (+10 / -10 with Fixed Length held).
 //   Shift held:      the note area shows the tempo (orange bar = hundreds, then tens and units in white), and the
 //                    Sends button (its printed Shift label is "Tap") is tap tempo: tap it in time; the average of the
@@ -121,6 +123,11 @@ const VELOCITY_LEVELS: [u8; 8] = [127, 112, 96, 80, 64, 48, 32, 16];
 const PROB_LEVELS: [u8; 8] = [100, 87, 75, 62, 50, 37, 25, 12];
 /// Transpose pads: note pad index - TRANSPOSE_ZERO_PAD = semitones (pads 8-31 -> -12 ... +11).
 const TRANSPOSE_ZERO_PAD: i8 = 20;
+/// Per-track step rates, in 24 PPQN clock pulses per step, fastest first (step pads 17-24 while a track button is
+/// held): 1/32, 1/16 triplet, 1/16, 1/8 triplet, 1/8, 1/4 triplet, 1/4, 1/2.
+const RATE_PULSES: [u32; 8] = [3, 4, 6, 8, 12, 16, 24, 48];
+const DEFAULT_RATE: u8 = 2;
+const RATE_PAD: usize = 16;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum Output {
@@ -226,6 +233,11 @@ struct Track {
     transpose: i8,
     position: u8, // next step to play
     playing_step: Option<u8>,
+    /// Step rate: index into RATE_PULSES (DEFAULT_RATE = 16ths).
+    rate: u8,
+    /// Time and length of the track's last played step (for quantising recorded notes).
+    last_step_us: u64,
+    step_len_us: u64,
 }
 
 impl Track {
@@ -245,6 +257,9 @@ impl Track {
             transpose: 0,
             position: 0,
             playing_step: None,
+            rate: DEFAULT_RATE,
+            last_step_us: 0,
+            step_len_us: 125_000,
         }
     }
 
@@ -330,9 +345,6 @@ pub struct SequencerApp {
     taps: [u64; TAP_HISTORY],
     /// Live recording armed (Record button); records while playing.
     record_armed: bool,
-    /// Time and length of the last played step (for quantising recorded notes).
-    last_step_us: u64,
-    last_step_len_us: u64,
     /// Notes being recorded, waiting for their note-off: (note, track, step, start time).
     rec_held: [Option<(u8, u8, u8, u64)>; 8],
     /// Per track: a step just recorded ahead of the playhead, not to be replayed on this pass.
@@ -472,8 +484,6 @@ impl SequencerApp {
             rt_sent_us: core::cell::Cell::new([0; 4]),
             taps: [0; TAP_HISTORY],
             record_armed: false,
-            last_step_us: 0,
-            last_step_len_us: 125_000,
             rec_held: [None; 8],
             skip_once: [None; TRACKS],
             rec_step: None,
@@ -633,26 +643,33 @@ impl SequencerApp {
         self.dirty = true;
     }
 
-    /// One clock pulse (24 PPQN). Even 16ths play on pulse 0 of their 8th-note pair; odd 16ths are due at pulse 6,
-    /// delayed by swing (50 % = straight, 75 % = triplet-ish), timed to the millisecond rather than to whole pulses.
+    /// One clock pulse (24 PPQN). Tracks at the default 16th rate: even 16ths play on pulse 0 of their 8th-note pair;
+    /// odd 16ths are due at pulse 6, delayed by swing (50 % = straight, 75 % = triplet-ish), timed to the millisecond
+    /// rather than to whole pulses. Tracks at other rates play straight, every RATE_PULSES pulses from the start.
     fn pulse(&mut self, now: u64, interval: u64) {
-        let in_pair = self.clock_count % 12;
+        let count = self.clock_count;
+        let in_pair = count % 12;
         let pair_us = interval * 12;
         let swing_us = pair_us * (self.swing.clamp(50, 75) as u64 - 50) / 100;
         if in_pair == 0 {
             if let Some((due, len)) = self.pending_step.take() {
-                self.play_step(due.min(now), len);
+                self.play_step(due.min(now), len, DEFAULT_RATE);
             }
-            self.play_step(now, pair_us / 2 + swing_us);
+            self.play_step(now, pair_us / 2 + swing_us, DEFAULT_RATE);
         } else if in_pair == 6 {
             let len = pair_us / 2 - swing_us;
             if swing_us < 1000 {
-                self.play_step(now, len);
+                self.play_step(now, len, DEFAULT_RATE);
             } else {
                 self.pending_step = Some((now + swing_us, len));
             }
         }
-        self.clock_count = self.clock_count.wrapping_add(1);
+        for (r, &p) in RATE_PULSES.iter().enumerate() {
+            if r as u8 != DEFAULT_RATE && count % p == 0 {
+                self.play_step(now, interval * p as u64, r as u8);
+            }
+        }
+        self.clock_count = count.wrapping_add(1);
     }
 
     fn run_clock(&mut self, now: u64) {
@@ -682,12 +699,16 @@ impl SequencerApp {
         }
     }
 
-    fn play_step(&mut self, time: u64, step_us: u64) {
-        self.last_step_us = time;
-        self.last_step_len_us = step_us;
+    /// Plays the next step of every track running at `rate`.
+    fn play_step(&mut self, time: u64, step_us: u64, rate: u8) {
         for t in 0..TRACKS {
+            if self.tracks[t].rate != rate {
+                continue;
+            }
             let (pos, step, muted, output, channel, transpose) = {
-                let tr = &self.tracks[t];
+                let tr = &mut self.tracks[t];
+                tr.last_step_us = time;
+                tr.step_len_us = step_us;
                 let pos = tr.position as usize % STEPS;
                 (pos, tr.pat().steps[pos], tr.muted, tr.output, tr.channel, tr.transpose)
             };
@@ -759,11 +780,12 @@ impl SequencerApp {
         let len = tr.pat().length.clamp(1, STEPS as u8);
         let Some(last) = tr.playing_step else { return };
         // Early in the current step: it belongs to the step that just played; late: to the next one.
-        let late = now.saturating_sub(self.last_step_us) >= self.last_step_len_us / 2;
+        let step_len = tr.step_len_us.max(1);
+        let late = now.saturating_sub(tr.last_step_us) >= step_len / 2;
         let step = if late { (last + 1) % len } else { last };
         let velocity = velocity.clamp(1, 127);
         let chord = matches!(self.rec_step, Some((rt, rs, at)) if rt == t as u8 && rs == step
-            && now.saturating_sub(at) < self.last_step_len_us.max(1));
+            && now.saturating_sub(at) < step_len);
         let s = &mut tr.pat_mut().steps[step as usize];
         if chord && s.on {
             // Another note of a chord played on this step: add it.
@@ -785,11 +807,11 @@ impl SequencerApp {
     /// Note released: its held length becomes the gate (in eighths of a step, 1-8).
     fn record_note_off(&mut self, note: u8) {
         let now = now_us();
-        let step_len = self.last_step_len_us.max(1);
         for slot in self.rec_held.iter_mut() {
             if let Some((n, t, step, start)) = *slot {
                 if n == note {
                     *slot = None;
+                    let step_len = self.tracks[t as usize].step_len_us.max(1);
                     let gate = ((now.saturating_sub(start) * 8 + step_len / 2) / step_len).clamp(1, 8) as u8;
                     let s = &mut self.tracks[t as usize].pat_mut().steps[step as usize];
                     if s.on && s.has(note) {
@@ -881,6 +903,8 @@ impl SequencerApp {
         if let Some(t) = self.held_track {
             if step < 16 {
                 self.tracks[t].channel = step as u8;
+            } else if (RATE_PAD..RATE_PAD + RATE_PULSES.len()).contains(&step) {
+                self.tracks[t].rate = (step - RATE_PAD) as u8;
             }
             self.dirty = true;
             return;
@@ -1059,7 +1083,7 @@ impl SequencerApp {
                 self.pending_step = None;
             } else if now >= due {
                 self.pending_step = None;
-                self.play_step(due, len);
+                self.play_step(due, len, DEFAULT_RATE);
             }
         }
         self.run_note_offs(now);
@@ -1089,6 +1113,7 @@ impl SequencerApp {
             s[6] = tr.chain_start;
             s[7] = tr.chain_end;
             s[8] = tr.transpose as u8;
+            s[9] = tr.rate + 1; // 0 in older projects = the default 16ths
             sink(&s);
             for pat in tr.patterns.iter() {
                 let mut b = [0u8; project::PATTERN_BYTES];
@@ -1133,6 +1158,10 @@ impl SequencerApp {
             tr.chain_start = s[6] % PATTERNS as u8;
             tr.chain_end = (s[7] % PATTERNS as u8).max(tr.chain_start);
             tr.transpose = (s[8] as i8).clamp(-24, 24);
+            tr.rate = match s[9] {
+                r @ 1..=8 => r - 1,
+                _ => DEFAULT_RATE,
+            };
             for (p, pat) in tr.patterns.iter_mut().enumerate() {
                 let o = base + project::TRACK_SETTINGS + p * pattern_bytes;
                 let b = &rec[o..o + pattern_bytes];
@@ -1282,10 +1311,22 @@ impl SequencerApp {
                 }
             }
         } else if let Some(t) = self.held_track {
-            // Track settings: channel on steps 1-16, outputs on note row 1.
+            // Track settings: channel on steps 1-16, step rate on steps 17-24, outputs on note row 1.
             for step in 0..STEPS {
                 let c = if step < 16 {
                     if step as u8 == self.tracks[t].channel { 0xFFFFFF } else { 0x101010 }
+                } else if (RATE_PAD..RATE_PAD + RATE_PULSES.len()).contains(&step) {
+                    let r = (step - RATE_PAD) as u8;
+                    // Straight rates green, triplets purple; the default (1/16) a little brighter when not chosen.
+                    let triplet = RATE_PULSES[r as usize] % 3 != 0; // 4, 8, 16 pulses
+                    let on = if triplet { 0xA040FF } else { 0x20FF40 };
+                    if r == self.tracks[t].rate {
+                        on
+                    } else if r == DEFAULT_RATE {
+                        dim(on, 2)
+                    } else {
+                        dim(on, 4)
+                    }
                 } else {
                     0
                 };

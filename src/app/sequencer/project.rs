@@ -7,7 +7,7 @@
 //        external clock), 7 reserved                                       = 16 bytes
 //   16   8 tracks x 2840 bytes:
 //          16 bytes settings: channel, output, muted, note, base, pattern, chain start, chain end, transpose (i8),
-//                             7 reserved
+//                             step rate + 1 (0 in older projects = 1/16), 6 reserved
 //          8 patterns x 353 bytes: length, then 32 steps x 11 bytes
 //                             (on << 7 | note 1, notes 2-8 (0xFF = none), velocity, gate 1-8, probability 1-100 %)
 //   22736 u32 CRC-32 (IEEE) of bytes 0..22736
