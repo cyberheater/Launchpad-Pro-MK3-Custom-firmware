@@ -24,6 +24,9 @@
 //   Hold a step + Shift: right-hand column = probability bar (top = 100 % ... bottom = 12 %).
 //   Hold a track button: note rows 2-4 = transpose (-12 ... +11 semitones; the dim pad is 0).
 //   Play (20)        start / stop.        Shift (90) + Up / Down: tempo +1 / -1 BPM (+10 / -10 with Fixed Length held).
+//   Shift held:      the note area shows the tempo (orange bar = hundreds, then tens and units in white), and the
+//                    Sends button (its printed Shift label is "Tap") is tap tempo: tap it in time; the average of the
+//                    last few taps sets the BPM (a 2 s pause starts over; ignored while following an external clock).
 //   Fixed Length (30) held + step pad: set the pattern length to that step.
 //   Clear (60) held + step pad: clear the step; + track button: clear the track's current pattern.
 //   Note (94)        back to the note/performance app; playback continues there (Sequencer button lit green).
@@ -71,6 +74,40 @@ const BTN_PLAY: u8 = 20;
 const BTN_PROJECTS: u8 = 98;
 const BTN_RECORD: u8 = 10;
 const BTN_PATTERNS: u8 = 89;
+/// The "Sends" button under the track row: its printed Shift function is "Tap".
+const BTN_TAP: u8 = 6;
+/// Taps averaged for tap tempo, and the gap after which tapping starts over.
+const TAP_HISTORY: usize = 5;
+const TAP_RESET_US: u64 = 2_000_000;
+
+/// 3 x 4 digits for the BPM readout, rows top to bottom, bit 2 = left column.
+const DIGITS: [[u8; 4]; 10] = [
+    [0b111, 0b101, 0b101, 0b111], // 0
+    [0b010, 0b110, 0b010, 0b111], // 1
+    [0b111, 0b011, 0b100, 0b111], // 2
+    [0b111, 0b011, 0b001, 0b111], // 3
+    [0b101, 0b101, 0b111, 0b001], // 4
+    [0b111, 0b110, 0b001, 0b111], // 5
+    [0b100, 0b111, 0b101, 0b111], // 6
+    [0b111, 0b001, 0b010, 0b010], // 7
+    [0b111, 0b111, 0b101, 0b111], // 8
+    [0b111, 0b101, 0b111, 0b001], // 9
+];
+
+/// BPM readout on the 8 x 4 note area (`col` 0-7 left to right, `row` 0-3 top to bottom): column 1 is the hundreds
+/// as a bar (1-3 pads from the bottom), columns 2-4 the tens digit, 6-8 the units digit.
+fn bpm_pixel(bpm: u16, col: usize, row: usize) -> u32 {
+    const DIGIT: u32 = 0xFFFFFF;
+    const HUNDREDS: u32 = 0xFF8000;
+    let (h, t, u) = ((bpm / 100) as usize, (bpm / 10 % 10) as usize, (bpm % 10) as usize);
+    let lit = |d: usize, x: usize| DIGITS[d][row] >> (2 - x) & 1 != 0;
+    match col {
+        0 => if 3 - row < h { HUNDREDS } else { 0x080400 },
+        1..=3 => if (h > 0 || t > 0) && lit(t, col - 1) { DIGIT } else { 0 },
+        5..=7 => if lit(u, col - 5) { DIGIT } else { 0 },
+        _ => 0,
+    }
+}
 
 const TRACK_COLOURS: [u32; TRACKS] =
     [0xFF2020, 0xFF8000, 0xFFE000, 0x40FF40, 0x00E0E0, 0x2060FF, 0xA040FF, 0xFF40C0];
@@ -283,6 +320,10 @@ pub struct SequencerApp {
     ext_active: bool,
     ext_last_pulse_us: u64,
     ext_interval_us: u64,
+    /// When we last sent F8 / FA / FB / FC: the same byte arriving within RT_ECHO_US of that is our own echo.
+    rt_sent_us: core::cell::Cell<[u64; 4]>,
+    /// Tap tempo (Shift + Sends/Tap): times of the recent taps, newest last; 0 = none.
+    taps: [u64; TAP_HISTORY],
     /// Live recording armed (Record button); records while playing.
     record_armed: bool,
     /// Time and length of the last played step (for quantising recorded notes).
@@ -423,6 +464,8 @@ impl SequencerApp {
             ext_active: false,
             ext_last_pulse_us: 0,
             ext_interval_us: 20_833,
+            rt_sent_us: core::cell::Cell::new([0; 4]),
+            taps: [0; TAP_HISTORY],
             record_armed: false,
             last_step_us: 0,
             last_step_len_us: 125_000,
@@ -472,6 +515,7 @@ impl SequencerApp {
     /// Transport/clock bytes: to every output when we are the clock master; when following an external clock only
     /// to the DIN outputs (passing the clock on), never back to USB where it may have come from.
     fn send_transport(&self, byte: u8) {
+        self.note_rt_sent(byte);
         if self.ext_active {
             driver::send_midi(MidiPort::Din, &[byte]);
             driver::send_midi(MidiPort::Din2, &[byte]);
@@ -480,9 +524,36 @@ impl SequencerApp {
         }
     }
 
+    fn rt_index(byte: u8) -> Option<usize> {
+        match byte {
+            0xF8 => Some(0),
+            0xFA => Some(1),
+            0xFB => Some(2),
+            0xFC => Some(3),
+            _ => None,
+        }
+    }
+
+    fn note_rt_sent(&self, byte: u8) {
+        if let Some(i) = Self::rt_index(byte) {
+            let mut t = self.rt_sent_us.get();
+            t[i] = now_us();
+            self.rt_sent_us.set(t);
+        }
+    }
+
     /// MIDI real-time messages from the USB MIDI port or DIN In (routed here by the app host whatever app is active).
+    /// A synth with MIDI Thru on DIN In echoes our own clock straight back; following that would make the clock chase
+    /// itself and run away. So a byte arriving within RT_ECHO_US of us sending the same byte is ignored. (Our clock
+    /// pulses are >= 8 ms apart even at 300 BPM, and a real external clock that is ignored once soon takes over.)
     pub fn on_realtime(&mut self, status: u8) {
+        const RT_ECHO_US: u64 = 6_000;
         let now = now_us();
+        if let Some(i) = Self::rt_index(status) {
+            if now.saturating_sub(self.rt_sent_us.get()[i]) < RT_ECHO_US {
+                return;
+            }
+        }
         match status {
             0xF8 => {
                 if self.ext_active && self.ext_last_pulse_us != 0 {
@@ -585,6 +656,7 @@ impl SequencerApp {
         }
         while now >= self.next_clock_us {
             let pulse_time = self.next_clock_us;
+            self.note_rt_sent(0xF8);
             send_all(&[0xF8]);
             self.pulse(pulse_time, interval);
             self.next_clock_us += interval;
@@ -924,6 +996,24 @@ impl SequencerApp {
         }
     }
 
+    /// Tap tempo: the average gap between the last few taps sets the tempo (internal clock only).
+    fn tap(&mut self) {
+        let now = now_us();
+        let last = self.taps[TAP_HISTORY - 1];
+        if last == 0 || now.saturating_sub(last) > TAP_RESET_US {
+            self.taps = [0; TAP_HISTORY];
+        }
+        self.taps.rotate_left(1);
+        self.taps[TAP_HISTORY - 1] = now;
+        let first = self.taps.iter().position(|&t| t != 0).unwrap_or(TAP_HISTORY - 1);
+        let gaps = (TAP_HISTORY - 1 - first) as u64;
+        if gaps >= 1 && !self.ext_active {
+            let interval = (now - self.taps[first]) / gaps;
+            self.bpm = (60_000_000 / interval.max(1)).clamp(30, 300) as u16;
+        }
+        self.dirty = true;
+    }
+
     fn shift_octave(&mut self, up: bool) {
         if let Some(t) = self.held_track {
             let ch = &mut self.tracks[t].channel;
@@ -1222,6 +1312,11 @@ impl SequencerApp {
                 _ => Step::single(track.note).notes,
             };
             for pad in 0..32 {
+                if swing_view {
+                    // Shift held: the note area shows the tempo.
+                    led::set(note_pad_index(pad), bpm_pixel(self.bpm, pad % 8, 3 - pad / 8));
+                    continue;
+                }
                 let note = track.base as usize + pad;
                 let c = if note > 127 {
                     0
@@ -1251,6 +1346,11 @@ impl SequencerApp {
             let tr = &self.tracks[t];
             let playing_note = self.playing && tr.playing_step.map_or(false, |p| tr.pat().steps[p as usize].on);
             led::set(1 + t as u8, if tr.muted { 0x300000 } else if playing_note { 0x40FF40 } else { 0x084008 });
+        }
+        if self.shift {
+            // Sends/Tap: white for a moment after a tap, amber otherwise.
+            let tapped = now_us().saturating_sub(self.taps[TAP_HISTORY - 1]) < 120_000;
+            led::set(BTN_TAP, if tapped { 0xFFFFFF } else { 0x603000 });
         }
 
         // Step edit bars: velocity on the right-hand column, gate on the bottom row (replaces the mute row).
@@ -1363,6 +1463,10 @@ impl App for SequencerApp {
                 self.tracks[self.selected].pat_mut().steps[step as usize].gate = i;
                 self.step_edited = true;
                 self.dirty = true;
+            }
+        } else if i == BTN_TAP && self.shift {
+            if event.pressed {
+                self.tap();
             }
         } else if (1..=8).contains(&i) {
             if event.pressed {
