@@ -6,7 +6,7 @@
 // at V5_LOW (0x10000-0x40000), slots 4-7 at V5_HIGH (0xC0000-0xF0000). Same layout as version 4 below except
 // 64 steps per pattern (8 patterns x 705 bytes, 8 tracks x 5656 bytes, CRC at 45264).
 // Version 4 (read): 32 steps per pattern, 8 slots of 32 KB at V4_BASE; the last-used-slot record stays at META_OFFSET.
-//   0    "LPS2", u8 version 4, u16 bpm, u8 swing (50-75 %), u8 flags (bit 0 = ignore
+//   0    "LPS2", u8 version 4, u16 bpm, u8 swing (50-75 %), u8 flags (bit 1 = follow
 //        external clock), 7 reserved                                       = 16 bytes
 //   16   8 tracks x 2840 bytes:
 //          16 bytes settings: channel, output, muted, note, base, pattern, chain start, chain end, transpose (i8),
@@ -141,8 +141,10 @@ pub fn available() -> bool {
     driver::user_storage_size() >= 0x10_0000
 }
 
-/// Header byte 8, bit 0: ignore an external MIDI clock (0 in older projects = follow it).
-pub const FLAG_IGNORE_CLOCK: u8 = 0x01;
+/// Header byte 8, bit 1: follow an external MIDI clock (Shift + Play). Clear = use the internal clock, the default; older
+/// projects never set it, so they load on the internal clock. (Bit 0, "ignore external clock" in earlier builds, is
+/// no longer used.)
+pub const FLAG_FOLLOW_CLOCK: u8 = 0x02;
 
 pub fn header(bpm: u16, swing: u8, flags: u8) -> [u8; HEADER] {
     let mut h = [0u8; HEADER];

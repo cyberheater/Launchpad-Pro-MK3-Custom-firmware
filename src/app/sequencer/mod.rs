@@ -19,7 +19,8 @@
 //                    turns off. Step brightness follows velocity.
 //   Patterns (89)    hold: the grid shows 8 patterns (rows, A = top) for each of the 8 tracks (columns): current =
 //                    track colour, chained = medium, has notes = dim, queued = white. Tap a pattern to switch to it
-//                    (at the end of the playing pattern, or at once when stopped); hold one and tap another in the
+//                    (at the end of the playing pattern, or at once when stopped; an empty pattern takes the length
+//                    of the current one); hold one and tap another in the
 //                    same column to chain the range. + Duplicate (50) held: copy the track's current pattern there.
 //                    + Clear held: clear that pattern.
 //   Hold Shift:      step pads show swing (pad 1 = 50 % straight ... pad 26 = 75 %); tap one to set it.
@@ -32,26 +33,27 @@
 //                    Sends button (its printed Shift label is "Tap") is tap tempo: tap it in time; the average of the
 //                    last few taps sets the BPM (a 2 s pause starts over; ignored while following an external clock).
 //   Fixed Length (30) held + step pad: set the pattern length to that step (33-64 on page 2).
-//   Clear (60) held + step pad: clear the step; + track button: clear the track's current pattern.
+//   Clear (60) held + step pad: clear the step; + track button: clear the track's current pattern (its length stays).
 //   Note (94)        back to the note/performance app; playback continues there (Sequencer button lit green).
 //   Record (10)      tap: arm / disarm live recording (red). While armed and playing, notes played on the note pads or
 //                    arriving on the USB MIDI port / DIN In (e.g. a keyboard) are written into the selected track's
 //                    current pattern at the nearest step, with their velocity and held length as the gate (a note held
 //                    over several steps keeps sounding for as long as it was held). A note recorded just ahead of a step is not replayed on that pass (you already heard it).
 //                    Notes played together land on the same step as a chord (up to 8; loudest velocity kept).
-//   MIDI thru        a keyboard on the USB MIDI port / DIN In plays the selected track: notes, aftertouch, controllers,
-//                    program change and pitch bend are re-sent on that track's output and channel. Echoes from a
+//   MIDI thru        a keyboard on the USB MIDI port / DIN In plays the selected track: notes, aftertouch, controllers
+//                    and pitch bend are re-sent on that track's output and channel (program change and bank select are
+//                    dropped). Echoes from a
 //                    keyboard with MIDI Thru are recognised and dropped (no loops, no double recording).
 //   Projects (98)    tap: save to the current project slot. Hold: the track row shows the 8 slots (white = current,
 //                    dim = saved, off = empty); tap one to load it (an empty slot just becomes the save target).
 //                    The Projects LED is green when everything is saved, amber with unsaved changes.
 //                    The last used slot is loaded automatically the first time the sequencer opens.
 //
-// Timing: a 24 PPQN clock derived from the system timer (not from tick counting), or an external MIDI clock
-// (USB MIDI port / DIN In: FA start, FB continue, FC stop, F8 pulses; clock passed on to both DIN outs; Play LED
-// cyan while following; back to internal 500 ms after the last pulse). One step = a 16th note = 6 clock pulses.
-// Shift + Play toggles following an external clock (while Shift is held, Play is cyan = follow, orange = ignore
-// incoming clock / start / stop and always use the internal tempo); the setting is saved with the project.
+// Timing: a 24 PPQN clock derived from the system timer (not from tick counting) - the default; incoming clock /
+// start / stop are ignored. Shift + Play switches to following an external MIDI clock (USB MIDI port / DIN In: FA
+// start, FB continue, FC stop, F8 pulses; clock passed on to both DIN outs; back to internal 500 ms after the last
+// pulse) and back. Play is green on the internal clock, orange while following an external one; while Shift is held
+// it shows the setting (green = internal, orange = external). Saved with the project. One step = a 16th = 6 pulses.
 // MIDI clock / start / stop go to USB and both DIN outputs.
 
 use crate::app::apptrait::App;
@@ -237,6 +239,11 @@ struct Pattern {
 impl Pattern {
     const EMPTY: Pattern = Pattern { steps: [Step::OFF; STEPS], length: 16 };
 
+    /// Clears every step but keeps the pattern's length.
+    fn clear(&mut self) {
+        self.steps = [Step::OFF; STEPS];
+    }
+
     fn has_notes(&self) -> bool {
         self.steps.iter().any(|s| s.on)
     }
@@ -366,7 +373,8 @@ pub struct SequencerApp {
     ext_active: bool,
     ext_last_pulse_us: u64,
     ext_interval_us: u64,
-    /// Ignore incoming MIDI clock / start / stop (Shift + Play toggles; saved with the project).
+    /// Ignore incoming MIDI clock / start / stop: the default (internal clock). Shift + Play switches to following an
+    /// external clock; saved with the project.
     ext_ignore: bool,
     /// When we last sent F8 / FA / FB / FC: the same byte arriving within RT_ECHO_US of that is our own echo.
     rt_sent_us: core::cell::Cell<[u64; 4]>,
@@ -514,7 +522,7 @@ impl SequencerApp {
             ext_active: false,
             ext_last_pulse_us: 0,
             ext_interval_us: 20_833,
-            ext_ignore: false,
+            ext_ignore: true,
             rt_sent_us: core::cell::Cell::new([0; 4]),
             taps: [0; TAP_HISTORY],
             record_armed: false,
@@ -932,8 +940,14 @@ impl SequencerApp {
         false
     }
 
-    /// Aftertouch, controllers, program change, channel pressure, pitch bend: to the selected track's channel.
+    /// Aftertouch, controllers, channel pressure, pitch bend: to the selected track's channel (not program change or
+    /// bank select).
     fn thru_other(&mut self, event: MidiEvent) {
+        // Program changes and bank select (CC 0 / CC 32) are never passed on: changing presets on the keyboard must
+        // not change the sound of whatever synth the selected track plays.
+        if event.status & 0xF0 == 0xC0 || (event.status & 0xF0 == 0xB0 && matches!(event.data1, 0 | 32)) {
+            return;
+        }
         let now = now_us();
         let key = (event.status & 0xF0, event.data1, event.data2);
         if self.thru_last.0 == key && now.saturating_sub(self.thru_last.1) < 100_000 {
@@ -1055,7 +1069,7 @@ impl SequencerApp {
     fn on_track_button(&mut self, t: usize, pressed: bool) {
         if pressed {
             if self.clear {
-                *self.tracks[t].pat_mut() = Pattern::EMPTY;
+                self.tracks[t].pat_mut().clear();
             } else {
                 self.selected = t;
                 self.held_track = Some(t);
@@ -1080,7 +1094,7 @@ impl SequencerApp {
             return;
         }
         if self.clear {
-            self.tracks[t].patterns[p as usize] = Pattern::EMPTY;
+            self.tracks[t].patterns[p as usize].clear();
             return;
         }
         self.selected = t;
@@ -1092,6 +1106,14 @@ impl SequencerApp {
             }
         };
         let tr = &mut self.tracks[t];
+        // A pattern with no notes yet is new: it takes the length of the track's current pattern.
+        let length = tr.pat().length;
+        for q in range.0..=range.1 {
+            let pat = &mut tr.patterns[q as usize];
+            if !pat.has_notes() {
+                pat.length = length;
+            }
+        }
         if self.playing {
             tr.queued = Some(range);
         } else {
@@ -1173,7 +1195,7 @@ impl SequencerApp {
 
     /// Streams the project body (everything before the CRC) to `sink`, in the current (version-4) layout.
     fn emit(&self, sink: &mut dyn FnMut(&[u8])) {
-        sink(&project::header(self.bpm, self.swing, if self.ext_ignore { project::FLAG_IGNORE_CLOCK } else { 0 }));
+        sink(&project::header(self.bpm, self.swing, if self.ext_ignore { 0 } else { project::FLAG_FOLLOW_CLOCK }));
         for tr in self.tracks.iter() {
             let mut s = [0u8; project::TRACK_SETTINGS];
             s[0] = tr.channel;
@@ -1214,7 +1236,7 @@ impl SequencerApp {
     fn load_record(&mut self, rec: &[u8; project::RECORD]) {
         self.bpm = u16::from_le_bytes([rec[5], rec[6]]).clamp(30, 300);
         self.swing = rec[7].clamp(50, 75);
-        self.ext_ignore = rec[8] & project::FLAG_IGNORE_CLOCK != 0;
+        self.ext_ignore = rec[8] & project::FLAG_FOLLOW_CLOCK == 0;
         if self.ext_ignore {
             self.ext_active = false;
         }
@@ -1266,7 +1288,7 @@ impl SequencerApp {
     fn load_v1(&mut self, rec: &[u8; project::V1_RECORD]) {
         self.bpm = u16::from_le_bytes([rec[5], rec[6]]).clamp(30, 300);
         self.swing = 50;
-        self.ext_ignore = false;
+        self.ext_ignore = true;
         for (t, tr) in self.tracks.iter_mut().enumerate() {
             let b = &rec[8 + t * project::V1_TRACK_BYTES..8 + (t + 1) * project::V1_TRACK_BYTES];
             *tr = Track::new(t as u8);
@@ -1521,14 +1543,15 @@ impl SequencerApp {
         }
 
         let beat = self.playing && (self.clock_count.wrapping_sub(1) / 24) % 4 == 0;
-        let (on, off) = if self.ext_active { (0x40FFFF, 0x106060) } else { (0x40FF40, 0x106010) };
+        // Green = internal clock, orange = external clock.
+        let (on, off) = if self.ext_active { (0xFF8000, 0x602000) } else { (0x40FF40, 0x106010) };
         let play = if self.shift && held_step.is_none() {
-            // Shift held: Play shows the clock-follow setting (cyan = follows external clock, orange = ignores it).
-            if self.ext_ignore { 0xFF6000 } else { 0x00C0C0 }
+            // Shift held: Play shows the clock setting (green = internal clock, the default; orange = follow external).
+            if self.ext_ignore { 0x00C000 } else { 0xFF6000 }
         } else if self.playing {
             if beat { on } else { off }
         } else if self.ext_active {
-            0x103030
+            0x301000
         } else {
             0x101010
         };
