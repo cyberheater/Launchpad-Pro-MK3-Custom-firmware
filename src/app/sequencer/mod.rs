@@ -3,7 +3,9 @@
 // 8-track step sequencer.
 //
 // Layout (Programmer-mode XY indices):
-//   Grid rows 8..5   steps 1-32 of the selected track's current pattern (row 8 = steps 1-8). Tap toggles a step.
+//   Grid rows 8..5   32 steps of the selected track's current pattern (row 8 = steps 1-8): steps 1-32, or 33-64
+//                    after ▶ (91 / 92 = ◀ / ▶ switch the page; the other page's arrow is green while the playhead is
+//                    on it). Patterns have up to 64 steps. Tap toggles a step.
 //                    Hold a step + tap a note pad = set that step's note; tap more pads in the same hold to build a
 //                    chord (up to 8 notes; tap a lit one again to remove it). Holding a step shows all its notes.
 //   Grid rows 4..1   32 chromatic notes from the track's base note (row 1 = lowest). Tap = choose the note
@@ -29,7 +31,7 @@
 //   Shift held:      the note area shows the tempo (orange bar = hundreds, then tens and units in white), and the
 //                    Sends button (its printed Shift label is "Tap") is tap tempo: tap it in time; the average of the
 //                    last few taps sets the BPM (a 2 s pause starts over; ignored while following an external clock).
-//   Fixed Length (30) held + step pad: set the pattern length to that step.
+//   Fixed Length (30) held + step pad: set the pattern length to that step (33-64 on page 2).
 //   Clear (60) held + step pad: clear the step; + track button: clear the track's current pattern.
 //   Note (94)        back to the note/performance app; playback continues there (Sequencer button lit green).
 //   Record (10)      tap: arm / disarm live recording (red). While armed and playing, notes played on the note pads or
@@ -131,6 +133,10 @@ const DEFAULT_RATE: u8 = 5;
 /// Longest gate, in eighths of a step (recorded notes held over several steps).
 const MAX_GATE: u8 = 255;
 const RATE_PAD: usize = 16;
+/// The step area shows 32 steps at a time: page 1 = steps 1-32, page 2 = steps 33-64 (◀ / ▶ switch).
+const PAGE_STEPS: usize = 32;
+const BTN_LEFT: u8 = 91;
+const BTN_RIGHT: u8 = 92;
 
 /// Step rate from track settings byte 10 (half pulses per step), or from byte 9 of the v0.2 test build (rate index
 /// + 1 in the old order 1/32, 1/16T, 1/16, 1/8T, 1/8, 1/4T, 1/4, 1/2; 1/2 becomes 1/1).
@@ -328,6 +334,8 @@ pub struct SequencerApp {
     pending_step: Option<(u64, u64)>,
     /// A step of a non-16th rate due between two clock pulses: (due, step length, rate).
     pending_half: Option<(u64, u64, u8)>,
+    /// Step page shown: 0 = steps 1-32, 1 = steps 33-64.
+    page: u8,
     next_clock_us: u64,
     clock_count: u32,
     offs: [Option<NoteOff>; MAX_OFFS],
@@ -478,6 +486,7 @@ impl SequencerApp {
             rng: 0x1234_5678,
             pending_step: None,
             pending_half: None,
+            page: 0,
             next_clock_us: 0,
             clock_count: 0,
             offs: [None; MAX_OFFS],
@@ -942,7 +951,9 @@ impl SequencerApp {
 
     // ---------------- input ----------------
 
-    fn on_step_pad(&mut self, step: usize, pressed: bool) {
+    /// `pad` is 0-31 in the step area; on page 2 it edits steps 33-64 (except for the settings shown on the pads).
+    fn on_step_pad(&mut self, pad: usize, pressed: bool) {
+        let step = self.page as usize * PAGE_STEPS + pad;
         if !pressed {
             if self.held_step == Some(step as u8) {
                 if self.step_pending_off && !self.step_edited {
@@ -954,17 +965,17 @@ impl SequencerApp {
             return;
         }
         if let Some(t) = self.held_track {
-            if step < 16 {
-                self.tracks[t].channel = step as u8;
-            } else if (RATE_PAD..RATE_PAD + RATE_HALF_PULSES.len()).contains(&step) {
-                self.tracks[t].rate = (step - RATE_PAD) as u8;
+            if pad < 16 {
+                self.tracks[t].channel = pad as u8;
+            } else if (RATE_PAD..RATE_PAD + RATE_HALF_PULSES.len()).contains(&pad) {
+                self.tracks[t].rate = (pad - RATE_PAD) as u8;
             }
             self.dirty = true;
             return;
         }
         if self.shift && self.held_step.is_none() {
-            if step < 26 {
-                self.swing = 50 + step as u8;
+            if pad < 26 {
+                self.swing = 50 + pad as u8;
             }
             self.dirty = true;
             return;
@@ -1207,8 +1218,8 @@ impl SequencerApp {
         if self.ext_ignore {
             self.ext_active = false;
         }
-        // Notes stored per step: 1 in version 2, 4 in version 3, 8 in version 4.
-        let (step_bytes, pattern_bytes, track_bytes, stored_notes) = project::layout(rec[4]);
+        // Notes stored per step: 1 in version 2, 4 in version 3, 8 from version 4; 32 steps per pattern before version 5.
+        let (step_bytes, pattern_bytes, track_bytes, stored_notes, stored_steps) = project::layout(rec[4]);
         for (t, tr) in self.tracks.iter_mut().enumerate() {
             let base = project::HEADER + t * track_bytes;
             let s = &rec[base..base + project::TRACK_SETTINGS];
@@ -1227,6 +1238,10 @@ impl SequencerApp {
                 let b = &rec[o..o + pattern_bytes];
                 pat.length = b[0].clamp(1, STEPS as u8);
                 for (i, st) in pat.steps.iter_mut().enumerate() {
+                    if i >= stored_steps {
+                        *st = Step::OFF;
+                        continue;
+                    }
                     let s = &b[1 + i * step_bytes..1 + (i + 1) * step_bytes];
                     st.on = s[0] & 0x80 != 0;
                     st.notes = Step::chord(s[0] & 0x7f);
@@ -1372,7 +1387,7 @@ impl SequencerApp {
             }
         } else if let Some(t) = self.held_track {
             // Track settings: channel on steps 1-16, step rate on steps 17-24, outputs on note row 1.
-            for step in 0..STEPS {
+            for step in 0..PAGE_STEPS {
                 let c = if step < 16 {
                     if step as u8 == self.tracks[t].channel { 0xFFFFFF } else { 0x101010 }
                 } else if (RATE_PAD..RATE_PAD + RATE_HALF_PULSES.len()).contains(&step) {
@@ -1414,10 +1429,12 @@ impl SequencerApp {
             let track = &self.tracks[sel];
             let pat = track.pat();
             let swing_view = self.shift && self.held_step.is_none();
-            for step in 0..STEPS {
+            let first = self.page as usize * PAGE_STEPS;
+            for pad in 0..PAGE_STEPS {
+                let step = first + pad;
                 let s = pat.steps[step];
                 let c = if swing_view {
-                    if step >= 26 { 0 } else if step as u8 <= self.swing - 50 { 0xFFA000 } else { 0x100800 }
+                    if pad >= 26 { 0 } else if pad as u8 <= self.swing - 50 { 0xFFA000 } else { 0x100800 }
                 } else if track.playing_step == Some(step as u8) && self.playing {
                     0xFFFFFF
                 } else if step as u8 >= pat.length {
@@ -1429,7 +1446,7 @@ impl SequencerApp {
                 } else {
                     0x080808
                 };
-                led::set(step_index(step), c);
+                led::set(step_index(pad), c);
             }
             // Held lit step: all its chord notes; otherwise the note new steps get.
             let shown = match self.held_step {
@@ -1518,6 +1535,24 @@ impl SequencerApp {
         led::set(BTN_PLAY, play);
         led::set(BTN_SEQUENCER, 0xFFFFFF);
         led::set(BTN_NOTE_MODE, 0x202020);
+        // ◀ / ▶: the page shown is white; the other page is green while the playhead is on it, grey if the pattern
+        // reaches it, dim if not.
+        let (sel_len, sel_play) = {
+            let tr = &self.tracks[self.selected];
+            (tr.pat().length as usize, tr.playing_step.filter(|_| self.playing).map(|p| p as usize / PAGE_STEPS))
+        };
+        for (pg, btn) in [(0u8, BTN_LEFT), (1u8, BTN_RIGHT)] {
+            let c = if self.page == pg {
+                0xFFFFFF
+            } else if sel_play == Some(pg as usize) {
+                0x00C000
+            } else if pg == 0 || sel_len > PAGE_STEPS {
+                0x303030
+            } else {
+                0x080808
+            };
+            led::set(btn, c);
+        }
         led::set(BTN_UP, 0x202020);
         led::set(BTN_DOWN, 0x202020);
         led::set(BTN_CLEAR, if self.clear { 0xFF4040 } else { 0x200808 });
@@ -1641,6 +1676,14 @@ impl App for SequencerApp {
                 BTN_PLAY if event.pressed && self.shift => self.toggle_ext_ignore(),
                 BTN_PLAY if event.pressed => {
                     if self.playing { self.stop() } else { self.start() }
+                }
+                BTN_LEFT if event.pressed => {
+                    self.page = 0;
+                    self.dirty = true;
+                }
+                BTN_RIGHT if event.pressed => {
+                    self.page = 1;
+                    self.dirty = true;
                 }
                 BTN_UP if event.pressed => self.shift_octave(true),
                 BTN_DOWN if event.pressed => self.shift_octave(false),

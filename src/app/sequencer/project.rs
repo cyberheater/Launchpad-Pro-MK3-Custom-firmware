@@ -2,7 +2,10 @@
 //
 // Sequencer project storage in the driver's user storage area.
 //
-// Version 4 (current): 8 slots of 32 KB at V4_BASE; the last-used-slot record stays at META_OFFSET.
+// Version 5 (current): 64 steps per pattern. 8 slots of 48 KB in the two gaps the older formats leave free: slots 0-3
+// at V5_LOW (0x10000-0x40000), slots 4-7 at V5_HIGH (0xC0000-0xF0000). Same layout as version 4 below except
+// 64 steps per pattern (8 patterns x 705 bytes, 8 tracks x 5656 bytes, CRC at 45264).
+// Version 4 (read): 32 steps per pattern, 8 slots of 32 KB at V4_BASE; the last-used-slot record stays at META_OFFSET.
 //   0    "LPS2", u8 version 4, u16 bpm, u8 swing (50-75 %), u8 flags (bit 0 = ignore
 //        external clock), 7 reserved                                       = 16 bytes
 //   16   8 tracks x 2840 bytes:
@@ -23,20 +26,23 @@ use crate::driver;
 pub const SLOTS: usize = 8;
 pub const TRACKS: usize = 8;
 pub const PATTERNS: usize = 8;
-pub const STEPS: usize = 32;
+pub const STEPS: usize = 64;
 
 const V2_BASE: u32 = 0x0004_0000;
 const V2_SLOT_SIZE: u32 = 0x4000;
 const META_OFFSET: u32 = V2_BASE + SLOTS as u32 * V2_SLOT_SIZE;
 const V4_BASE: u32 = 0x0008_0000;
-const SLOT_SIZE: u32 = 0x8000;
+const V4_SLOT_SIZE: u32 = 0x8000;
+const V5_LOW: u32 = 0x0001_0000;
+const V5_HIGH: u32 = 0x000C_0000;
+const SLOT_SIZE: u32 = 0xC000;
 const MAGIC: [u8; 4] = *b"LPS2";
 const META_MAGIC: [u8; 4] = *b"LPSN";
 
 pub const MAX_NOTES: usize = 8;
 pub const NO_NOTE: u8 = 0xFF;
 
-pub const VERSION: u8 = 4;
+pub const VERSION: u8 = 5;
 pub const HEADER: usize = 16;
 pub const TRACK_SETTINGS: usize = 16;
 pub const STEP_BYTES: usize = MAX_NOTES + 3;
@@ -45,20 +51,27 @@ pub const TRACK_BYTES: usize = TRACK_SETTINGS + PATTERNS * PATTERN_BYTES;
 pub const BODY: usize = HEADER + TRACKS * TRACK_BYTES;
 pub const RECORD: usize = BODY + 4;
 const _: () = assert!(RECORD as u32 <= SLOT_SIZE);
+// The low slots end where the v2/v3 area starts; the high slots start after the v4 area and stay inside 1 MB.
+const _: () = assert!(V5_LOW + 4 * SLOT_SIZE <= V2_BASE);
+const _: () = assert!(V4_BASE + SLOTS as u32 * V4_SLOT_SIZE <= V5_HIGH);
+const _: () = assert!(V5_HIGH + 4 * SLOT_SIZE <= 0x10_0000);
 
-const _: () = assert!(V4_BASE + SLOTS as u32 * SLOT_SIZE <= 0x10_0000);
+fn slot_addr(slot: usize) -> u32 {
+    if slot < 4 { V5_LOW + slot as u32 * SLOT_SIZE } else { V5_HIGH + (slot as u32 - 4) * SLOT_SIZE }
+}
 
-/// Layout of a stored record by version: (step bytes, pattern bytes, track bytes, notes per step).
-pub const fn layout(version: u8) -> (usize, usize, usize, usize) {
+/// Layout of a stored record by version: (step bytes, pattern bytes, track bytes, notes per step, steps per pattern).
+pub const fn layout(version: u8) -> (usize, usize, usize, usize, usize) {
     let notes = match version {
         2 => 1,
         3 => 4,
         _ => MAX_NOTES,
     };
+    let steps = if version >= 5 { STEPS } else { 32 };
     let step = if notes == 1 { 4 } else { notes + 3 };
-    let pattern = 1 + STEPS * step;
+    let pattern = 1 + steps * step;
     let track = TRACK_SETTINGS + PATTERNS * pattern;
-    (step, pattern, track, notes)
+    (step, pattern, track, notes, steps)
 }
 
 const fn body(version: u8) -> usize {
@@ -115,7 +128,7 @@ pub fn crc32(data: &[u8]) -> u32 {
     c.value()
 }
 
-/// One shared record buffer (~22 KB) for save/load; the sequencer only runs on the main loop.
+/// One shared record buffer (~45 KB) for save/load; the sequencer only runs on the main loop.
 struct Buffer(UnsafeCell<[u8; RECORD]>);
 unsafe impl Sync for Buffer {}
 static BUFFER: Buffer = Buffer(UnsafeCell::new([0; RECORD]));
@@ -125,7 +138,7 @@ pub fn with_buffer<R>(f: impl FnOnce(&mut [u8; RECORD]) -> R) -> R {
 }
 
 pub fn available() -> bool {
-    driver::user_storage_size() >= V4_BASE + SLOTS as u32 * SLOT_SIZE
+    driver::user_storage_size() >= 0x10_0000
 }
 
 /// Header byte 8, bit 0: ignore an external MIDI clock (0 in older projects = follow it).
@@ -148,7 +161,7 @@ pub fn seal(rec: &mut [u8; RECORD]) {
 
 fn valid(rec: &[u8; RECORD]) -> bool {
     let body = match rec[4] {
-        2 | 3 | VERSION => body(rec[4]),
+        2 | 3 | 4 | VERSION => body(rec[4]),
         _ => return false,
     };
     rec[0..4] == MAGIC
@@ -159,18 +172,23 @@ fn valid(rec: &[u8; RECORD]) -> bool {
 pub fn slot_used(slot: usize) -> bool {
     let mut h = [0u8; 8];
     slot < SLOTS
-        && ((driver::read_user_storage(V4_BASE + slot as u32 * SLOT_SIZE, &mut h) && h[0..4] == MAGIC && h[4] == VERSION)
+        && ((driver::read_user_storage(slot_addr(slot), &mut h) && h[0..4] == MAGIC && h[4] == VERSION)
+            || (driver::read_user_storage(V4_BASE + slot as u32 * V4_SLOT_SIZE, &mut h) && h[0..4] == MAGIC && h[4] == 4)
             || (driver::read_user_storage(V2_BASE + slot as u32 * V2_SLOT_SIZE, &mut h)
                 && h[0..4] == MAGIC
                 && matches!(h[4], 2 | 3)))
 }
 
-/// Reads a slot: the current-format record if there is one, else an older v3/v2 record from the old slot area.
+/// Reads a slot: the current-format record if there is one, else an older v4, v3 or v2 record from its old area.
 pub fn read_slot(slot: usize, rec: &mut [u8; RECORD]) -> bool {
     if slot >= SLOTS {
         return false;
     }
-    if driver::read_user_storage(V4_BASE + slot as u32 * SLOT_SIZE, rec) && rec[4] == VERSION && valid(rec) {
+    if driver::read_user_storage(slot_addr(slot), rec) && rec[4] == VERSION && valid(rec) {
+        return true;
+    }
+    let v4 = &mut rec[..body(4) + 4];
+    if driver::read_user_storage(V4_BASE + slot as u32 * V4_SLOT_SIZE, v4) && rec[4] == 4 && valid(rec) {
         return true;
     }
     let old = &mut rec[..V2_SLOT_SIZE as usize];
@@ -178,7 +196,7 @@ pub fn read_slot(slot: usize, rec: &mut [u8; RECORD]) -> bool {
 }
 
 pub fn write_slot(slot: usize, rec: &[u8; RECORD]) -> bool {
-    slot < SLOTS && driver::write_user_storage(V4_BASE + slot as u32 * SLOT_SIZE, rec)
+    slot < SLOTS && driver::write_user_storage(slot_addr(slot), rec)
 }
 
 /// Version-1 record from the earlier single-pattern format, if one exists in this slot.
