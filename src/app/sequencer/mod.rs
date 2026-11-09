@@ -37,6 +37,8 @@
 //                    Sends button (its printed Shift label is "Tap") is tap tempo: tap it in time; the average of the
 //                    last few taps sets the BPM (a 2 s pause starts over; ignored while following an external clock).
 //   Fixed Length (30) held + step pad: set the pattern length to that step (33-64 on page 2).
+//   Duplicate (50) held: tap a lit step to copy it (lights cyan), then tap steps to paste it (notes, length, velocity,
+//                    probability); works across both pages.
 //   Clear (60) held + step pad: clear the step; + track button: clear the track's current pattern (its length stays).
 //   Note (94)        back to the note/performance app; playback continues there (Sequencer button lit green).
 //   Record (10)      tap: arm / disarm live recording (red). While armed and playing, notes played on the note pads or
@@ -382,6 +384,8 @@ pub struct SequencerApp {
     /// Mute / Solo mode for the track buttons, and the flash phase of the armed button (redrawn when it changes).
     arm: Arm,
     blink: bool,
+    /// Duplicate held: the step being copied to every step tapped next.
+    copy_src: Option<u8>,
     next_clock_us: u64,
     clock_count: u32,
     offs: [Option<NoteOff>; MAX_OFFS],
@@ -536,6 +540,7 @@ impl SequencerApp {
             page: 0,
             arm: Arm::Off,
             blink: false,
+            copy_src: None,
             next_clock_us: 0,
             clock_count: 0,
             offs: [None; MAX_OFFS],
@@ -1047,6 +1052,17 @@ impl SequencerApp {
             }
         } else if self.clear {
             track.pat_mut().steps[step] = Step::OFF;
+        } else if self.duplicate {
+            // Duplicate held: the first lit step tapped is copied; every step tapped after it gets a copy (notes,
+            // length, velocity, probability). Releasing Duplicate forgets the copy.
+            match self.copy_src {
+                None if track.pat().steps[step].on => self.copy_src = Some(step as u8),
+                Some(src) if src as usize != step => {
+                    let copy = track.pat().steps[src as usize];
+                    track.pat_mut().steps[step] = copy;
+                }
+                _ => {}
+            }
         } else {
             let s = &mut track.pat_mut().steps[step];
             self.step_pending_off = s.on;
@@ -1520,6 +1536,8 @@ impl SequencerApp {
                 let s = pat.steps[step];
                 let c = if swing_view {
                     if pad >= 26 { 0 } else if pad as u8 <= self.swing - 50 { 0xFFA000 } else { 0x100800 }
+                } else if self.duplicate && self.copy_src == Some(step as u8) {
+                    0x00FFFF // the step being copied
                 } else if track.playing_step == Some(step as u8) && self.playing {
                     0xFFFFFF
                 } else if step as u8 >= pat.length {
@@ -1716,6 +1734,7 @@ impl App for SequencerApp {
         self.duplicate = false;
         self.fixed_length = false;
         self.arm = Arm::Off;
+        self.copy_src = None;
     }
 
     fn on_surface(&mut self, event: SurfaceEvent) {
@@ -1787,6 +1806,7 @@ impl App for SequencerApp {
                 }
                 BTN_DUPLICATE => {
                     self.duplicate = event.pressed;
+                    self.copy_src = None;
                     self.dirty = true;
                 }
                 BTN_PATTERNS => {
