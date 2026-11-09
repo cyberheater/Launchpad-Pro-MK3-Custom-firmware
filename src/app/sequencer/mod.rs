@@ -46,6 +46,10 @@
 //                    current pattern at the nearest step, with their velocity and held length as the gate (a note held
 //                    over several steps keeps sounding for as long as it was held). A note recorded just ahead of a step is not replayed on that pass (you already heard it).
 //                    Notes played together land on the same step as a chord (up to 8; loudest velocity kept).
+//                    Armed while stopped = step recording: the cursor (white) starts on step 1; each note played goes on
+//                    the cursor step (notes held together = a chord) and the cursor moves on when they are released.
+//                    Tap a step to move the cursor (leaving the steps between as they were). After the pattern's last
+//                    step Record disarms.
 //   MIDI thru        a keyboard on the USB MIDI port / DIN In plays the selected track: notes, aftertouch, controllers
 //                    and pitch bend are re-sent on that track's output and channel (program change and bank select are
 //                    dropped). Echoes from a
@@ -434,6 +438,10 @@ pub struct SequencerApp {
     skip_once: [Option<u8>; TRACKS],
     /// Last recorded step (track, step, time): notes landing on it within a step's time join it as a chord.
     rec_step: Option<(u8, u8, u64)>,
+    /// Step recording (Record armed while stopped): the step the next note goes to, and the notes held on it now
+    /// (the cursor moves on when they are all released, so notes held together make a chord).
+    step_cursor: u8,
+    step_rec_notes: [u8; MAX_NOTES],
     /// A note pad has been tapped during the current step hold (the first tap replaces the chord, later ones add).
     hold_notes_set: bool,
     /// Keyboard notes being passed through: (note, output, channel), so note-offs follow their note-ons.
@@ -577,6 +585,8 @@ impl SequencerApp {
             pulse_interval_us: 20_833,
             skip_once: [None; TRACKS],
             rec_step: None,
+            step_cursor: 0,
+            step_rec_notes: [NO_NOTE; MAX_NOTES],
             hold_notes_set: false,
             thru_held: [None; 16],
             thru_last: ((0, 0, 0), 0),
@@ -727,6 +737,7 @@ impl SequencerApp {
         self.skip_once = [None; TRACKS];
         self.pending_step = None;
         self.pending_half = None;
+        self.step_record_reset();
         self.stop_notes();
         for t in self.tracks.iter_mut() {
             t.playing_step = None;
@@ -886,6 +897,10 @@ impl SequencerApp {
 
     /// Writes a played note into the selected track at the nearest step (if recording).
     fn record_note_on(&mut self, note: u8, velocity: u8) {
+        if self.record_armed && !self.playing {
+            self.step_record_note_on(note, velocity);
+            return;
+        }
         if !(self.record_armed && self.playing) {
             return;
         }
@@ -923,6 +938,7 @@ impl SequencerApp {
     /// Note released: its held length becomes the gate, in eighths of a step: 1 up to MAX_GATE (about 32 steps), so a
     /// held note can last over several steps.
     fn record_note_off(&mut self, note: u8) {
+        self.step_record_note_off(note);
         let pos = self.clock_pos(now_us());
         for slot in self.rec_held.iter_mut() {
             if let Some((n, t, step, start)) = *slot {
@@ -939,6 +955,60 @@ impl SequencerApp {
                 }
             }
         }
+    }
+
+    // ---------------- step recording ----------------
+
+    /// Record armed while stopped: the note goes on the cursor step (replacing what was there; notes played while it
+    /// is still held join it as a chord), with its velocity and the default gate.
+    fn step_record_note_on(&mut self, note: u8, velocity: u8) {
+        let tr = &mut self.tracks[self.selected];
+        let len = tr.pat().length.clamp(1, STEPS as u8);
+        if self.step_cursor >= len {
+            self.step_cursor = 0;
+        }
+        let velocity = velocity.clamp(1, 127);
+        let first = self.step_rec_notes.iter().all(|&n| n == NO_NOTE);
+        let s = &mut tr.pat_mut().steps[self.step_cursor as usize];
+        if first {
+            *s = Step { velocity, ..Step::single(note) };
+        } else {
+            s.add(note);
+            s.velocity = s.velocity.max(velocity);
+        }
+        if !self.step_rec_notes.contains(&note) {
+            if let Some(slot) = self.step_rec_notes.iter_mut().find(|n| **n == NO_NOTE) {
+                *slot = note;
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// All the notes on the cursor step released: move to the next step. After the pattern's last step, recording
+    /// ends (Record disarms) and the cursor goes back to step 1.
+    fn step_record_note_off(&mut self, note: u8) {
+        let Some(slot) = self.step_rec_notes.iter_mut().find(|n| **n == note) else { return };
+        *slot = NO_NOTE;
+        if self.step_rec_notes.iter().any(|&n| n != NO_NOTE) {
+            return;
+        }
+        let len = self.tracks[self.selected].pat().length.clamp(1, STEPS as u8);
+        self.step_cursor += 1;
+        if self.step_cursor >= len {
+            self.step_cursor = 0;
+            self.record_armed = false;
+        }
+        self.page = self.step_cursor / PAGE_STEPS as u8;
+        self.dirty = true;
+    }
+
+    fn step_record_reset(&mut self) {
+        self.step_cursor = 0;
+        self.step_rec_notes = [NO_NOTE; MAX_NOTES];
+    }
+
+    fn step_recording(&self) -> bool {
+        self.record_armed && !self.playing
     }
 
     // ---------------- MIDI thru ----------------
@@ -1062,6 +1132,12 @@ impl SequencerApp {
                     track.pat_mut().steps[step] = copy;
                 }
                 _ => {}
+            }
+        } else if self.record_armed && !self.playing {
+            // Step recording: tapping a step moves the cursor there (skipped steps keep what they had).
+            if step < track.pat().length as usize {
+                self.step_cursor = step as u8;
+                self.step_rec_notes = [NO_NOTE; MAX_NOTES];
             }
         } else {
             let s = &mut track.pat_mut().steps[step];
@@ -1540,6 +1616,8 @@ impl SequencerApp {
                     0x00FFFF // the step being copied
                 } else if track.playing_step == Some(step as u8) && self.playing {
                     0xFFFFFF
+                } else if self.step_recording() && self.step_cursor as usize == step {
+                    0xFFFFFF // step recording: where the next note goes
                 } else if step as u8 >= pat.length {
                     0
                 } else if s.on {
@@ -1818,6 +1896,10 @@ impl App for SequencerApp {
                 }
                 BTN_RECORD if event.pressed => {
                     self.record_armed = !self.record_armed;
+                    self.step_record_reset();
+                    if self.record_armed && !self.playing {
+                        self.page = 0;
+                    }
                     self.dirty = true;
                 }
                 BTN_PLAY if event.pressed && self.shift => self.toggle_ext_ignore(),
