@@ -21,12 +21,12 @@
 //   Hold a step:     right-hand column = velocity bar (top = 127 ... bottom = 16), bottom row = gate length in
 //                    eighths of a step (1 = shortest, 8 = whole step; a longer recorded note shows all 8); a lit step tapped and released without an edit
 //                    turns off. Step brightness follows velocity.
-//   Patterns (89)    hold: the grid shows 8 patterns (rows, A = top) for each of the 8 tracks (columns): current =
-//                    track colour, chained = medium, has notes = dim, queued = white. Tap a pattern to switch to it
-//                    (at the end of the playing pattern, or at once when stopped; an empty pattern takes the length
-//                    of the current one); hold one and tap another in the
-//                    same column to chain the range. + Duplicate (50) held: copy the track's current pattern there.
-//                    + Clear held: clear that pattern.
+//   Patterns (89)    hold: the top two grid rows show the project's 16 patterns (1-8 on the top row, 9-16 below).
+//                    A pattern holds all 8 tracks and every track is on the same pattern: current = white, chained =
+//                    orange, has notes = dim orange, queued = cyan. Tap a pattern to switch to it (at the end of the
+//                    playing pattern, or at once when stopped; an empty pattern takes the length of the current one);
+//                    hold one and tap another to chain the range. + Duplicate (50) held: copy the current pattern
+//                    there. + Clear held: clear that pattern.
 //   Hold Shift:      step pads show swing (pad 1 = 50 % straight ... pad 26 = 75 %); tap one to set it.
 //   Hold a step + Shift: right-hand column = probability bar (top = 100 % ... bottom = 12 %).
 //   Hold a track button: note rows 2-4 = transpose (-12 ... +11 semitones; the dim pad is 0); steps 17-24 = step
@@ -54,10 +54,11 @@
 //                    and pitch bend are re-sent on that track's output and channel (program change and bank select are
 //                    dropped). Echoes from a
 //                    keyboard with MIDI Thru are recognised and dropped (no loops, no double recording).
-//   Projects (98)    tap: save to the current project slot. Hold: the track row shows the 8 slots (white = current,
-//                    dim = saved, off = empty); tap one to load it (an empty slot just becomes the save target).
-//                    The Projects LED is green when everything is saved, amber with unsaved changes.
-//                    The last used slot is loaded automatically the first time the sequencer opens.
+//   Projects (98)    tap: save the current project. Hold: the top four grid rows show the 32 projects (white =
+//                    current, dim = saved, off = empty); tap one to switch to it - the current project is saved first,
+//                    and an empty one opens as a new, blank project. The Projects LED is green when everything is
+//                    saved, amber with unsaved changes. The current project is opened when the sequencer first opens.
+//                    Projects store only the steps in use (up to 30 KB each, about 2,500 used steps).
 //
 // Timing: a 24 PPQN clock derived from the system timer (not from tick counting) - the default; incoming clock /
 // start / stop are ignored. Shift + Play switches to following an external MIDI clock (USB MIDI port / DIN In: FA
@@ -406,7 +407,8 @@ pub struct SequencerApp {
     clear: bool,
     duplicate: bool,
     patterns_held: bool,
-    pattern_hold: [Option<u8>; TRACKS],
+    /// Pattern pad held in the patterns view (a second one tapped meanwhile chains the range).
+    pattern_hold: Option<u8>,
     dirty: bool,
     switch: Option<AppId>,
     loaded: bool,
@@ -485,10 +487,20 @@ fn note_pad_from_index(index: u8) -> Option<usize> {
     if (1..=4).contains(&row) && (1..=8).contains(&col) { Some((row - 1) * 8 + col - 1) } else { None }
 }
 
-/// Grid index -> (track, pattern) in the patterns view (columns = tracks, rows = patterns, A at the top).
-fn pattern_from_index(index: u8) -> Option<(usize, u8)> {
+/// Grid index -> pad number counted from the top-left (row 8 = 0-7, row 7 = 8-15, ...): patterns 0-15 and
+/// projects 0-31 are numbered this way.
+fn grid_number(index: u8) -> Option<u8> {
     let (row, col) = ((index / 10) as usize, (index % 10) as usize);
-    if (1..=8).contains(&row) && (1..=8).contains(&col) { Some((col - 1, (8 - row) as u8)) } else { None }
+    if (1..=8).contains(&row) && (1..=8).contains(&col) { Some(((8 - row) * 8 + col - 1) as u8) } else { None }
+}
+
+/// LED index of grid pad `n` counted from the top-left (0-63): patterns 0-15, projects 0-31.
+fn top16_index(n: usize) -> u8 {
+    ((8 - n / 8) * 10 + n % 8 + 1) as u8
+}
+
+fn is_grid(index: u8) -> bool {
+    (1..=8).contains(&(index / 10)) && (1..=8).contains(&(index % 10))
 }
 
 /// Scales a colour by n/256.
@@ -517,6 +529,34 @@ fn send(output: Output, data: &[u8]) {
             driver::send_midi(MidiPort::Din2, data);
         }
     }
+}
+
+/// A step as stored: on << 7 | note 1, notes 2-8 (0xFF = none), velocity, gate, probability.
+fn step_bytes(st: &Step) -> [u8; project::STEP_BYTES] {
+    let mut b = [0u8; project::STEP_BYTES];
+    b[0] = ((st.on as u8) << 7) | (st.notes[0] & 0x7f);
+    b[1..MAX_NOTES].copy_from_slice(&st.notes[1..]);
+    b[MAX_NOTES] = st.velocity;
+    b[MAX_NOTES + 1] = st.gate;
+    b[MAX_NOTES + 2] = st.prob;
+    b
+}
+
+/// A stored step with `notes` note bytes (1, 4 or 8), then velocity, gate, probability.
+fn step_from_bytes(s: &[u8], notes: usize) -> Step {
+    let mut st = Step::OFF;
+    st.on = s[0] & 0x80 != 0;
+    st.notes = Step::chord(s[0] & 0x7f);
+    for (k, &n) in s[1..notes].iter().enumerate() {
+        if n <= 127 {
+            st.notes[1 + k] = n;
+        }
+    }
+    let rest = &s[notes..];
+    st.velocity = rest[0].clamp(1, 127);
+    st.gate = rest[1].max(1);
+    st.prob = rest[2].clamp(1, 100);
+    st
 }
 
 fn send_all(data: &[u8]) {
@@ -563,7 +603,7 @@ impl SequencerApp {
             clear: false,
             duplicate: false,
             patterns_held: false,
-            pattern_hold: [None; TRACKS],
+            pattern_hold: None,
             dirty: true,
             switch: None,
             loaded: false,
@@ -1231,48 +1271,54 @@ impl SequencerApp {
         self.dirty = true;
     }
 
-    fn on_pattern_pad(&mut self, t: usize, p: u8, pressed: bool) {
+    /// A pattern pad in the patterns view. Patterns are song-wide: every track switches together.
+    fn on_pattern_pad(&mut self, p: u8, pressed: bool) {
+        let p = p.min(PATTERNS as u8 - 1);
         if !pressed {
-            if self.pattern_hold[t] == Some(p) {
-                self.pattern_hold[t] = None;
+            if self.pattern_hold == Some(p) {
+                self.pattern_hold = None;
             }
             return;
         }
         self.dirty = true;
         if self.duplicate {
-            let tr = &mut self.tracks[t];
-            tr.patterns[p as usize] = *tr.pat();
+            for tr in self.tracks.iter_mut() {
+                tr.patterns[p as usize] = *tr.pat();
+            }
             return;
         }
         if self.clear {
-            self.tracks[t].patterns[p as usize].clear();
+            for tr in self.tracks.iter_mut() {
+                tr.patterns[p as usize].clear();
+            }
             return;
         }
-        self.selected = t;
-        let range = match self.pattern_hold[t] {
+        let range = match self.pattern_hold {
             Some(first) if first != p => (first.min(p), first.max(p)),
             _ => {
-                self.pattern_hold[t] = Some(p);
+                self.pattern_hold = Some(p);
                 (p, p)
             }
         };
-        let tr = &mut self.tracks[t];
-        // A pattern with no notes yet is new: it takes the length of the track's current pattern.
-        let length = tr.pat().length;
-        for q in range.0..=range.1 {
-            let pat = &mut tr.patterns[q as usize];
-            if !pat.has_notes() {
-                pat.length = length;
+        let playing = self.playing;
+        for tr in self.tracks.iter_mut() {
+            // A pattern with no notes yet is new: it takes the length of the track's current pattern.
+            let length = tr.pat().length;
+            for q in range.0..=range.1 {
+                let pat = &mut tr.patterns[q as usize];
+                if !pat.has_notes() {
+                    pat.length = length;
+                }
             }
-        }
-        if self.playing {
-            tr.queued = Some(range);
-        } else {
-            tr.chain_start = range.0;
-            tr.chain_end = range.1;
-            tr.pattern = range.0;
-            tr.position = 0;
-            tr.queued = None;
+            if playing {
+                tr.queued = Some(range);
+            } else {
+                tr.chain_start = range.0;
+                tr.chain_end = range.1;
+                tr.pattern = range.0;
+                tr.position = 0;
+                tr.queued = None;
+            }
         }
     }
 
@@ -1344,9 +1390,10 @@ impl SequencerApp {
 
     // ---------------- projects ----------------
 
-    /// Streams the project body (everything before the CRC) to `sink`, in the current (version-4) layout.
+    /// Streams the project body (everything before the CRC) to `sink`, in the version-6 layout (the length field in
+    /// the header is left 0; `project::seal6` fills it in).
     fn emit(&self, sink: &mut dyn FnMut(&[u8])) {
-        sink(&project::header(self.bpm, self.swing, if self.ext_ignore { 0 } else { project::FLAG_FOLLOW_CLOCK }));
+        sink(&project::header6(self.bpm, self.swing, if self.ext_ignore { 0 } else { project::FLAG_FOLLOW_CLOCK }));
         for tr in self.tracks.iter() {
             let mut s = [0u8; project::TRACK_SETTINGS];
             s[0] = tr.channel;
@@ -1359,87 +1406,165 @@ impl SequencerApp {
             s[6] = tr.chain_start;
             s[7] = tr.chain_end;
             s[8] = tr.transpose as u8;
-            // Step rate as half clock pulses per step (0 in older projects = the default 16ths). Byte 9 held the
-            // first, fastest-first rate index of the v0.2 test build; it is now always 0.
             s[10] = RATE_HALF_PULSES[tr.rate as usize % RATE_HALF_PULSES.len()] as u8;
             sink(&s);
+        }
+        let empty = step_bytes(&Step::OFF);
+        for tr in self.tracks.iter() {
             for pat in tr.patterns.iter() {
-                let mut b = [0u8; project::PATTERN_BYTES];
-                b[0] = pat.length;
+                let used = pat.steps.iter().filter(|st| step_bytes(st) != empty).count();
+                sink(&[pat.length, used as u8]);
                 for (i, st) in pat.steps.iter().enumerate() {
-                    let o = 1 + i * project::STEP_BYTES;
-                    b[o] = ((st.on as u8) << 7) | (st.notes[0] & 0x7f);
-                    b[o + 1..o + MAX_NOTES].copy_from_slice(&st.notes[1..]);
-                    b[o + MAX_NOTES] = st.velocity;
-                    b[o + MAX_NOTES + 1] = st.gate;
-                    b[o + MAX_NOTES + 2] = st.prob;
+                    let b = step_bytes(st);
+                    if b != empty {
+                        sink(&[i as u8]);
+                        sink(&b);
+                    }
                 }
-                sink(&b);
             }
         }
     }
 
+    /// Fingerprint of the song, for the Projects LED (unsaved changes) and to tell whether switching project needs a
+    /// save. Runs on every redraw, so the 8,192 steps are folded in directly instead of going through `emit`.
     fn current_crc(&self) -> u32 {
         let mut crc = project::Crc::new();
-        self.emit(&mut |b| crc.update(b));
-        crc.value()
+        crc.update(&project::header6(self.bpm, self.swing, self.ext_ignore as u8));
+        for tr in self.tracks.iter() {
+            crc.update(&[
+                tr.channel,
+                tr.output as u8,
+                tr.muted as u8,
+                tr.solo as u8,
+                tr.note,
+                tr.base,
+                tr.pattern,
+                tr.chain_start,
+                tr.chain_end,
+                tr.transpose as u8,
+                tr.rate,
+            ]);
+        }
+        let mut h = crc.value();
+        let mut mix = |w: u32| h = (h ^ w).wrapping_mul(0x0100_0193).rotate_left(5);
+        for tr in self.tracks.iter() {
+            for pat in tr.patterns.iter() {
+                mix(pat.length as u32);
+                for st in pat.steps.iter() {
+                    let n = &st.notes;
+                    mix(u32::from_le_bytes([n[0], n[1], n[2], n[3]]));
+                    mix(u32::from_le_bytes([n[4], n[5], n[6], n[7]]));
+                    mix(u32::from_le_bytes([st.on as u8, st.velocity, st.gate, st.prob]));
+                }
+            }
+        }
+        h
     }
 
-    fn load_record(&mut self, rec: &[u8; project::RECORD]) {
-        self.bpm = u16::from_le_bytes([rec[5], rec[6]]).clamp(30, 300);
-        self.swing = rec[7].clamp(50, 75);
-        self.ext_ignore = rec[8] & project::FLAG_FOLLOW_CLOCK == 0;
+    fn load_header(&mut self, h: &[u8]) {
+        self.bpm = u16::from_le_bytes([h[5], h[6]]).clamp(30, 300);
+        self.swing = h[7].clamp(50, 75);
+        self.ext_ignore = h[8] & project::FLAG_FOLLOW_CLOCK == 0;
         if self.ext_ignore {
             self.ext_active = false;
         }
+    }
+
+    fn load_settings(tr: &mut Track, s: &[u8], patterns: usize) {
+        tr.channel = s[0] & 0x0f;
+        tr.output = Output::ALL[(s[1] as usize).min(3)];
+        tr.muted = s[2] != 0;
+        tr.solo = s[11] != 0;
+        tr.pending_mute = false;
+        tr.pending_solo = false;
+        tr.note = s[3] & 0x7f;
+        tr.base = s[4].min(96);
+        tr.pattern = s[5] % patterns as u8;
+        tr.chain_start = s[6] % patterns as u8;
+        tr.chain_end = (s[7] % patterns as u8).max(tr.chain_start);
+        tr.transpose = (s[8] as i8).clamp(-24, 24);
+        tr.rate = rate_from_saved(s[10], s[9]);
+        tr.queued = None;
+        tr.position = 0;
+        tr.playing_step = None;
+    }
+
+    /// Every track on track 1's pattern and chain (patterns are song-wide).
+    fn sync_patterns(&mut self) {
+        let (p, a, b) = (self.tracks[0].pattern, self.tracks[0].chain_start, self.tracks[0].chain_end);
+        for tr in self.tracks.iter_mut() {
+            (tr.pattern, tr.chain_start, tr.chain_end, tr.queued) = (p, a, b, None);
+        }
+    }
+
+    /// Loads a version-6 record of `len` bytes (CRC already checked). False if it is malformed.
+    fn load_record6(&mut self, rec: &[u8], len: usize) -> bool {
+        let body = &rec[..len - 4];
+        let settings_end = project::HEADER + TRACKS * project::TRACK_SETTINGS;
+        if body.len() < settings_end {
+            return false;
+        }
+        self.load_header(body);
+        for (t, tr) in self.tracks.iter_mut().enumerate() {
+            let o = project::HEADER + t * project::TRACK_SETTINGS;
+            Self::load_settings(tr, &body[o..o + project::TRACK_SETTINGS], PATTERNS);
+        }
+        let mut pos = settings_end;
+        for tr in self.tracks.iter_mut() {
+            for pat in tr.patterns.iter_mut() {
+                pat.steps = [Step::OFF; STEPS];
+                if pos + 2 > body.len() {
+                    pat.length = 16;
+                    continue;
+                }
+                pat.length = body[pos].clamp(1, STEPS as u8);
+                let n = body[pos + 1] as usize;
+                pos += 2;
+                for _ in 0..n {
+                    if pos + 1 + project::STEP_BYTES > body.len() {
+                        break;
+                    }
+                    let i = body[pos] as usize;
+                    if i < STEPS {
+                        pat.steps[i] = step_from_bytes(&body[pos + 1..pos + 1 + project::STEP_BYTES], MAX_NOTES);
+                    }
+                    pos += 1 + project::STEP_BYTES;
+                }
+            }
+        }
+        self.sync_patterns();
+        true
+    }
+
+    /// Loads an old (version 2-5) record: its 8 per-track patterns become patterns 1-8.
+    fn load_record(&mut self, rec: &[u8; project::RECORD]) {
+        self.load_header(rec);
         // Notes stored per step: 1 in version 2, 4 in version 3, 8 from version 4; 32 steps per pattern before version 5.
         let (step_bytes, pattern_bytes, track_bytes, stored_notes, stored_steps) = project::layout(rec[4]);
         for (t, tr) in self.tracks.iter_mut().enumerate() {
             let base = project::HEADER + t * track_bytes;
-            let s = &rec[base..base + project::TRACK_SETTINGS];
-            tr.channel = s[0] & 0x0f;
-            tr.output = Output::ALL[(s[1] as usize).min(3)];
-            tr.muted = s[2] != 0;
-            tr.solo = s[11] != 0;
-            tr.pending_mute = false;
-            tr.pending_solo = false;
-            tr.note = s[3] & 0x7f;
-            tr.base = s[4].min(96);
-            tr.pattern = s[5] % PATTERNS as u8;
-            tr.chain_start = s[6] % PATTERNS as u8;
-            tr.chain_end = (s[7] % PATTERNS as u8).max(tr.chain_start);
-            tr.transpose = (s[8] as i8).clamp(-24, 24);
-            tr.rate = rate_from_saved(s[10], s[9]);
+            Self::load_settings(tr, &rec[base..base + project::TRACK_SETTINGS], project::OLD_PATTERNS);
             for (p, pat) in tr.patterns.iter_mut().enumerate() {
+                if p >= project::OLD_PATTERNS {
+                    *pat = Pattern::EMPTY;
+                    continue;
+                }
                 let o = base + project::TRACK_SETTINGS + p * pattern_bytes;
                 let b = &rec[o..o + pattern_bytes];
                 pat.length = b[0].clamp(1, STEPS as u8);
                 for (i, st) in pat.steps.iter_mut().enumerate() {
-                    if i >= stored_steps {
-                        *st = Step::OFF;
-                        continue;
-                    }
-                    let s = &b[1 + i * step_bytes..1 + (i + 1) * step_bytes];
-                    st.on = s[0] & 0x80 != 0;
-                    st.notes = Step::chord(s[0] & 0x7f);
-                    for (k, &n) in s[1..stored_notes].iter().enumerate() {
-                        if n <= 127 {
-                            st.notes[1 + k] = n;
-                        }
-                    }
-                    let rest = &s[stored_notes..];
-                    st.velocity = rest[0].clamp(1, 127);
-                    st.gate = rest[1].max(1);
-                    st.prob = rest[2].clamp(1, 100);
+                    *st = if i < stored_steps {
+                        step_from_bytes(&b[1 + i * step_bytes..1 + (i + 1) * step_bytes], stored_notes)
+                    } else {
+                        Step::OFF
+                    };
                 }
             }
-            tr.queued = None;
-            tr.position = 0;
-            tr.playing_step = None;
         }
+        self.sync_patterns();
     }
 
-    /// Imports a version-1 (single pattern) record into pattern A of each track.
+    /// Imports a version-1 (single pattern) record into pattern 1 of each track.
     fn load_v1(&mut self, rec: &[u8; project::V1_RECORD]) {
         self.bpm = u16::from_le_bytes([rec[5], rec[6]]).clamp(30, 300);
         self.swing = 50;
@@ -1462,76 +1587,144 @@ impl SequencerApp {
         }
     }
 
+    /// A new, empty project.
+    fn load_blank(&mut self) {
+        for (t, tr) in self.tracks.iter_mut().enumerate() {
+            *tr = Track::new(t as u8);
+        }
+        self.bpm = 120;
+        self.swing = 50;
+        self.ext_ignore = true;
+        self.ext_active = false;
+    }
+
     fn scan_slots(&mut self) {
         // Headers only: reading and checking every full record took noticeably long on entry.
         for (s, flag) in self.slot_saved.iter_mut().enumerate() {
-            *flag = project::slot_used(s);
+            *flag = project::slot_used6(s);
         }
     }
 
-    /// First entry after boot: load the last used project.
+    /// First entry after boot: open the current project (converting the old 8 projects once, the first time).
     fn load_initial(&mut self) {
         self.loaded = true;
         if !project::available() {
             self.saved_crc = self.current_crc();
             return;
         }
+        let slot = match project::current6() {
+            Some(s) => s,
+            None => self.migrate(),
+        };
         self.scan_slots();
-        let slot = project::last_slot();
-        self.load_slot(slot, false);
+        self.load_slot(slot);
     }
 
-    fn load_slot(&mut self, slot: usize, remember: bool) {
-        self.slot = slot;
-        let loaded = project::with_buffer(|rec| {
-            if project::read_slot(slot, rec) {
-                if self.playing {
-                    self.stop();
-                }
-                self.load_record(rec);
-                true
-            } else {
-                false
-            }
-        });
-        if loaded {
-            self.saved_crc = self.current_crc();
-        } else {
-            let mut v1 = [0u8; project::V1_RECORD];
-            if project::read_v1_slot(slot, &mut v1) {
-                if self.playing {
-                    self.stop();
-                }
-                self.load_v1(&v1);
-                self.saved_crc = 0; // not yet saved in the new format
-            } else {
-                // Empty slot: keep the current project; it becomes the save target ("save as").
-                self.saved_crc = 0;
-            }
+    /// One-time conversion of the old projects (8 slots of 8 per-track patterns, spread over the 1 MB area) into
+    /// version-6 projects 1-8, whose slots overlap the old areas. A project is written only once no unconverted
+    /// project's data lies under its new slot (when that is possible), so nothing is overwritten before it has been
+    /// read. Returns the project to open.
+    fn migrate(&mut self) -> usize {
+        let last = project::last_slot();
+        let mut src = [None; project::OLD_SLOTS];
+        for (j, s) in src.iter_mut().enumerate() {
+            *s = project::old_source(j);
         }
-        if remember {
-            project::set_last_slot(slot);
+        let overlaps = |a: (u32, u32), b: (u32, u32)| a.0 < b.0 + b.1 && b.0 < a.0 + a.1;
+        let dest = |j: usize| (j as u32 * project::SLOT_SIZE6, project::SLOT_SIZE6);
+        while let Some(first) = (0..project::OLD_SLOTS).find(|&j| src[j].is_some()) {
+            let j = (0..project::OLD_SLOTS)
+                .filter(|&j| src[j].is_some())
+                .find(|&j| (0..project::OLD_SLOTS).all(|k| k == j || src[k].map_or(true, |s| !overlaps(dest(j), s))))
+                .unwrap_or(first);
+            let mut loaded = project::with_buffer(|buf| {
+                let rec = project::old_record(buf);
+                if project::read_slot(j, rec) {
+                    self.load_record(rec);
+                    true
+                } else {
+                    false
+                }
+            });
+            if !loaded {
+                let mut v1 = [0u8; project::V1_RECORD];
+                if project::read_v1_slot(j, &mut v1) {
+                    self.load_v1(&v1);
+                    loaded = true;
+                }
+            }
+            if loaded {
+                let _ = self.write_project(j);
+            }
+            src[j] = None;
+        }
+        project::set_current6(last);
+        last
+    }
+
+    /// Opens project `slot` (a blank project if it is empty) and makes it the current one.
+    fn load_slot(&mut self, slot: usize) {
+        let slot = slot % project::SLOTS;
+        self.slot = slot;
+        let was_playing = self.playing;
+        if self.playing {
+            self.stop();
+        }
+        let loaded = project::with_buffer(|buf| match project::read_slot6(slot, buf) {
+            Some(len) => self.load_record6(&buf[..], len),
+            None => false,
+        });
+        if !loaded {
+            self.load_blank();
+        }
+        // A new, untouched project counts as saved: switching away from it does not store an empty project.
+        self.saved_crc = self.current_crc();
+        if was_playing {
+            self.start();
         }
         self.dirty = true;
+    }
+
+    /// Projects grid: save the current project if it changed, then open `slot`.
+    fn switch_project(&mut self, slot: usize) {
+        if slot == self.slot {
+            return;
+        }
+        if self.current_crc() != self.saved_crc {
+            self.save();
+        }
+        self.load_slot(slot);
+        project::set_current6(self.slot);
+    }
+
+    /// Writes the song to project `slot`. Returns the CRC of what was written, or None (no storage, or too big).
+    fn write_project(&mut self, slot: usize) -> Option<u32> {
+        let crc = self.current_crc();
+        project::with_buffer(|buf| {
+            let mut pos = 0;
+            let mut fits = true;
+            self.emit(&mut |b| {
+                if pos + b.len() + 4 <= project::SLOT_SIZE6 as usize {
+                    buf[pos..pos + b.len()].copy_from_slice(b);
+                } else {
+                    fits = false;
+                }
+                pos += b.len();
+            });
+            let len = if fits { project::seal6(buf, pos) } else { None }?;
+            project::write_slot6(slot, &buf[..len]).then_some(crc)
+        })
     }
 
     fn save(&mut self) {
         if !project::available() {
             return;
         }
-        let (ok, crc) = project::with_buffer(|rec| {
-            let mut pos = 0;
-            self.emit(&mut |b| {
-                rec[pos..pos + b.len()].copy_from_slice(b);
-                pos += b.len();
-            });
-            project::seal(rec);
-            (project::write_slot(self.slot, rec), project::crc32(&rec[..project::BODY]))
-        });
-        if ok {
+        if let Some(crc) = self.write_project(self.slot) {
             self.slot_saved[self.slot] = true;
             self.saved_crc = crc;
             self.save_flash_until = now_us() + 400_000;
+            project::set_current6(self.slot);
         }
         self.dirty = true;
     }
@@ -1542,25 +1735,30 @@ impl SequencerApp {
         let sel = self.selected;
         let colour = TRACK_COLOURS[sel];
 
-        if self.patterns_held {
-            for t in 0..TRACKS {
-                let tr = &self.tracks[t];
-                let tc = TRACK_COLOURS[t];
-                for p in 0..PATTERNS as u8 {
-                    let queued = tr.queued.map_or(false, |(a, b)| (a..=b).contains(&p));
-                    let c = if queued {
-                        0xFFFFFF
+        if self.patterns_held || self.projects_held {
+            // Top rows: the 16 patterns (two rows) or 32 projects (four rows); the rest of the grid dark.
+            let shown = if self.projects_held { project::SLOTS } else { PATTERNS };
+            for n in 0..64 {
+                let c = if n >= shown {
+                    0
+                } else if self.projects_held {
+                    if n == self.slot { 0xFFFFFF } else if self.slot_saved[n] { 0x303030 } else { 0x050505 }
+                } else {
+                    let tr = &self.tracks[0];
+                    let p = n as u8;
+                    if tr.queued.map_or(false, |(a, b)| (a..=b).contains(&p)) {
+                        0x00FFFF
                     } else if p == tr.pattern {
-                        tc
-                    } else if (tr.chain_start..=tr.chain_end).contains(&p) {
-                        scale(tc, 110)
-                    } else if tr.patterns[p as usize].has_notes() {
-                        dim(tc, 3)
+                        0xFFFFFF
+                    } else if tr.chain_end > tr.chain_start && (tr.chain_start..=tr.chain_end).contains(&p) {
+                        0xFF8000
+                    } else if self.tracks.iter().any(|t| t.patterns[n].has_notes()) {
+                        0x301400
                     } else {
                         0x050505
-                    };
-                    led::set((8 - p) * 10 + t as u8 + 1, c);
-                }
+                    }
+                };
+                led::set(top16_index(n), c);
             }
         } else if let Some(t) = self.held_track {
             // Track settings: channel on steps 1-16, step rate on steps 17-24, outputs on note row 1.
@@ -1667,9 +1865,7 @@ impl SequencerApp {
                 Arm::Solo { .. } => tr.pending_solo,
                 _ => tr.pending_mute,
             };
-            let track_led = if self.projects_held {
-                if t == self.slot { 0xFFFFFF } else if self.slot_saved[t] { 0x303030 } else { 0 }
-            } else if pending && self.blink {
+            let track_led = if pending && self.blink {
                 0xFFFFFF
             } else if let Arm::Mute { .. } = self.arm {
                 if tr.muted { 0x300000 } else { tc }
@@ -1707,7 +1903,7 @@ impl SequencerApp {
         }
 
         // Step edit bars: velocity on the right-hand column, gate on the bottom row (replaces the mute row).
-        let held = if self.held_track.is_none() && !self.patterns_held { self.held_step } else { None };
+        let held = if self.held_track.is_none() && !self.patterns_held && !self.projects_held { self.held_step } else { None };
         let held_step = held.map(|st| self.tracks[sel].pat().steps[st as usize]);
         for k in 0..8u8 {
             let idx = (8 - k) * 10 + 9;
@@ -1806,7 +2002,7 @@ impl App for SequencerApp {
         self.held_track = None;
         self.projects_held = false;
         self.patterns_held = false;
-        self.pattern_hold = [None; TRACKS];
+        self.pattern_hold = None;
         self.shift = false;
         self.clear = false;
         self.duplicate = false;
@@ -1817,17 +2013,21 @@ impl App for SequencerApp {
 
     fn on_surface(&mut self, event: SurfaceEvent) {
         let i = event.index;
-        if let (true, Some((t, p))) = (self.patterns_held, pattern_from_index(i)) {
-            self.on_pattern_pad(t, p, event.pressed);
+        if self.projects_held && is_grid(i) {
+            if let (true, Some(n)) = (event.pressed, grid_number(i)) {
+                if (n as usize) < project::SLOTS {
+                    self.projects_used = true;
+                    self.switch_project(n as usize);
+                }
+            }
+        } else if self.patterns_held && is_grid(i) {
+            if let Some(p) = grid_number(i).filter(|&p| (p as usize) < PATTERNS) {
+                self.on_pattern_pad(p, event.pressed);
+            }
         } else if let Some(step) = step_from_index(i) {
             self.on_step_pad(step, event.pressed);
         } else if let Some(pad) = note_pad_from_index(i) {
             self.on_note_pad(pad, event.pressed, event.value);
-        } else if (101..=108).contains(&i) && self.projects_held {
-            if event.pressed {
-                self.projects_used = true;
-                self.load_slot((i - 101) as usize, true);
-            }
         } else if let (true, false) = ((101..=108).contains(&i), self.arm == Arm::Off) {
             if event.pressed {
                 self.mute_solo_tap((i - 101) as usize);
@@ -1890,7 +2090,7 @@ impl App for SequencerApp {
                 BTN_PATTERNS => {
                     self.patterns_held = event.pressed;
                     if !event.pressed {
-                        self.pattern_hold = [None; TRACKS];
+                        self.pattern_hold = None;
                     }
                     self.dirty = true;
                 }

@@ -51,9 +51,11 @@ use static_cell::StaticCell;
 use self::runtime::RuntimeDriver;
 
 type AppHostType = AppHost;
-static APP_HOST: StaticCell<
+// Built at compile time in place: the app host (the sequencer's song alone is ~100 KB) is too big to build on the
+// stack first and move into a StaticCell.
+static APP_HOST: static_cell::ConstStaticCell<
     embassy_sync::mutex::Mutex<embassy_sync::blocking_mutex::raw::ThreadModeRawMutex, AppHostType>,
-> = StaticCell::new();
+> = static_cell::ConstStaticCell::new(embassy_sync::mutex::Mutex::new(AppHost::new(AppId::Boot)));
 pub type SharedAppHost =
     embassy_sync::mutex::Mutex<embassy_sync::blocking_mutex::raw::ThreadModeRawMutex, AppHostType>;
 
@@ -128,8 +130,7 @@ async fn main(_spawner: Spawner) {
     usb::init();
     din::init();
 
-    let app_host = AppHost::new(AppId::Boot);
-    let app_host = APP_HOST.init(embassy_sync::mutex::Mutex::new(app_host));
+    let app_host = APP_HOST.take();
 
     app_host.lock().await.init();
 
