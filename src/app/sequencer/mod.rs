@@ -21,7 +21,8 @@
 //   Hold a step:     right-hand column = velocity bar (top = 127 ... bottom = 16), bottom row = gate length in
 //                    eighths of a step (1 = shortest, 8 = whole step; a longer recorded note shows all 8); a lit step tapped and released without an edit
 //                    turns off. Step brightness follows velocity.
-//   Patterns (89)    hold: the top two grid rows show the project's 16 patterns (1-8 on the top row, 9-16 below).
+//   Patterns (89)    tap: latch the pattern view open (white; tap again to close); or hold it, use the pattern
+//                    pads and let go (closes on release). Open: the top two grid rows show the project's 16 patterns (1-8 on the top row, 9-16 below).
 //                    A pattern holds all 8 tracks and every track is on the same pattern: current = white, chained =
 //                    orange, has notes = dim orange, queued = cyan. Tap a pattern to switch to it (at the end of the
 //                    playing pattern, or at once when stopped; an empty pattern takes the length of the current one);
@@ -407,6 +408,10 @@ pub struct SequencerApp {
     clear: bool,
     duplicate: bool,
     patterns_held: bool,
+    /// Patterns button physically down, and whether a pattern pad was used during this press: a plain tap latches
+    /// the pattern view open (tap again to close); holding it and using a pattern pad closes it on release.
+    patterns_down: bool,
+    patterns_used: bool,
     /// Pattern pad held in the patterns view (a second one tapped meanwhile chains the range).
     pattern_hold: Option<u8>,
     dirty: bool,
@@ -603,6 +608,8 @@ impl SequencerApp {
             clear: false,
             duplicate: false,
             patterns_held: false,
+            patterns_down: false,
+            patterns_used: false,
             pattern_hold: None,
             dirty: true,
             switch: None,
@@ -2002,6 +2009,7 @@ impl App for SequencerApp {
         self.held_track = None;
         self.projects_held = false;
         self.patterns_held = false;
+        self.patterns_down = false;
         self.pattern_hold = None;
         self.shift = false;
         self.clear = false;
@@ -2022,6 +2030,9 @@ impl App for SequencerApp {
             }
         } else if self.patterns_held && is_grid(i) {
             if let Some(p) = grid_number(i).filter(|&p| (p as usize) < PATTERNS) {
+                if event.pressed && self.patterns_down {
+                    self.patterns_used = true;
+                }
                 self.on_pattern_pad(p, event.pressed);
             }
         } else if let Some(step) = step_from_index(i) {
@@ -2088,8 +2099,18 @@ impl App for SequencerApp {
                     self.dirty = true;
                 }
                 BTN_PATTERNS => {
-                    self.patterns_held = event.pressed;
-                    if !event.pressed {
+                    // Tap: latch the pattern view open / closed. Hold + pattern pads: momentary, closes on release.
+                    self.patterns_down = event.pressed;
+                    let close = if event.pressed {
+                        self.patterns_used = false;
+                        let was_open = self.patterns_held;
+                        self.patterns_held = true;
+                        was_open
+                    } else {
+                        self.patterns_used
+                    };
+                    if close {
+                        self.patterns_held = false;
                         self.pattern_hold = None;
                     }
                     self.dirty = true;
