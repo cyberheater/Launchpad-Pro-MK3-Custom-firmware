@@ -34,12 +34,18 @@
 //                    move to another step or swap notes with another lit step; the button turns purple). Long press
 //                    (0.6 s): back to the part as it was before the first tap (the button flashes white). The
 //                    original is kept in memory only, per track, for the pattern last mutated.
-//   Probability (49) tap: probability page (button cyan; tap again to close): the grid shows 8 steps of the selected
-//                    track as bars (top = 100 % ... bottom = 12 %; off steps faint); tap a pad to set that step's
-//                    probability. ◀ / ▶ move 8 steps at a time (steps 1-8 ... 57-64).
+//   Probability (49) tap: probability page (button cyan; tap again to close). Top two rows = 16 levels, left to
+//                    right: 100 % (every time), 94, 88 ... 12, 6 % (hardly ever). Rows 3-6 = the selected track's
+//                    steps (◀ / ▶ = 1-32 / 33-64), lit by how likely they are to play: tap a lit step to select it
+//                    (white; its level lights white), then tap a level to set it. ◀ / ▶ move 8 steps at a time (steps 1-8 ... 57-64).
+//   Pattern Settings (69) tap: page for the selected track's current pattern (button orange; tap again to close):
+//                    tap a step pad to make it the last step (◀ / ▶ = steps 1-32 / 33-64); the bottom note row sets
+//                    the pattern's step rate (same order and colours as below). Each pattern has its own rate; when a
+//                    chain moves to a pattern at another rate, it starts where the last step of the one before ends.
 //   Hold a track button: note rows 2-4 = transpose (-12 ... +11 semitones; the dim pad is 0); steps 17-24 = step
-//                    rate, slowest left: 1/1, 1/4, 1/4T, 1/8, 1/8T, 1/16 (default), 1/16T, 1/32 (green = straight,
-//                    purple = triplet). Swing only applies to 1/16 tracks; other rates play straight.
+//                    rate of all the track's patterns, slowest left: 1/1, 1/4, 1/4T, 1/8, 1/8T, 1/16 (default),
+//                    1/16T, 1/32 (green = straight, purple = triplet). Swing only applies at 1/16; other rates play
+//                    straight. A new (empty) pattern takes the length and rate of the one before.
 //   Play (20)        start / stop. With Record armed and the count-in on (Setup page, pad 21), Play first counts
 //                    one bar in: the grid flashes red on 4 beats at the current tempo, then playback and recording
 //                    start (not while following an external clock; Play again during the count-in cancels it).        Shift (90) + Up / Down: tempo +1 / -1 BPM (+10 / -10 with Fixed Length held).
@@ -106,6 +112,8 @@ const BTN_RECORD: u8 = 10;
 const BTN_PATTERNS: u8 = 89;
 /// Right-hand column, 5th from the top (printed "Probability"): opens the probability page.
 const BTN_PROBABILITY: u8 = 49;
+/// Right-hand column: Pattern Settings (latched page: the selected track's pattern length and step rate).
+const BTN_PATTERN_SETTINGS: u8 = 69;
 /// Right-hand column, 6th from the top (printed "Mutation"): tap = shuffle the selected track's part, long press =
 /// back to how it was before the first shuffle.
 const BTN_MUTATE: u8 = 39;
@@ -153,6 +161,22 @@ const OUTPUT_COLOURS: [u32; 4] = [0xFFFFFF, 0x00FF60, 0x00A0FF, 0x00FFFF];
 const VELOCITY_LEVELS: [u8; 8] = [127, 112, 96, 80, 64, 48, 32, 16];
 /// Probability bar (Shift + held step): top button = always.
 const PROB_LEVELS: [u8; 8] = [100, 87, 75, 62, 50, 37, 25, 12];
+/// Probability page: 16 levels on the top two rows (level 1 = every time ... level 16 = hardly ever).
+const PROB_LEVELS16: [u8; 16] = [100, 94, 88, 81, 75, 69, 62, 56, 50, 44, 38, 31, 25, 19, 12, 6];
+
+/// Probability page: grid index of level `lv` (0-15) on the top two rows, and of step pad `pad` (0-31) on rows 6-3.
+fn prob_level_index(lv: usize) -> u8 {
+    ((8 - lv / 8) * 10 + lv % 8 + 1) as u8
+}
+
+fn prob_step_index(pad: usize) -> u8 {
+    ((6 - pad / 8) * 10 + pad % 8 + 1) as u8
+}
+
+/// The probability page level (0-15) nearest to a step's probability.
+fn prob_level(prob: u8) -> usize {
+    (0..16).min_by_key(|&i| (PROB_LEVELS16[i] as i16 - prob as i16).abs()).unwrap_or(0)
+}
 /// Transpose pads: note pad index - TRANSPOSE_ZERO_PAD = semitones (pads 8-31 -> -12 ... +11).
 const TRANSPOSE_ZERO_PAD: i8 = 20;
 /// Per-track step rates, in half clock pulses (24 PPQN) per step, slowest first (step pads 17-24 while a track
@@ -276,10 +300,12 @@ impl Step {
 struct Pattern {
     steps: [Step; STEPS],
     length: u8,
+    /// Step rate: index into RATE_HALF_PULSES (DEFAULT_RATE = 16ths). Each pattern has its own.
+    rate: u8,
 }
 
 impl Pattern {
-    const EMPTY: Pattern = Pattern { steps: [Step::OFF; STEPS], length: 16 };
+    const EMPTY: Pattern = Pattern { steps: [Step::OFF; STEPS], length: 16, rate: DEFAULT_RATE };
 
     /// Clears every step but keeps the pattern's length.
     fn clear(&mut self) {
@@ -312,8 +338,9 @@ struct Track {
     transpose: i8,
     position: u8, // next step to play
     playing_step: Option<u8>,
-    /// Step rate: index into RATE_HALF_PULSES (DEFAULT_RATE = 16ths).
-    rate: u8,
+    /// After moving to a pattern with a different step rate: the clock pulse its first step is due at (the end of
+    /// the last step of the pattern before), so the new rate does not start early.
+    resume_pulse: u32,
     /// Time and length of the track's last played step (for quantising recorded notes).
     last_step_us: u64,
     step_len_us: u64,
@@ -339,7 +366,7 @@ impl Track {
             transpose: 0,
             position: 0,
             playing_step: None,
-            rate: DEFAULT_RATE,
+            resume_pulse: 0,
             last_step_us: 0,
             step_len_us: 125_000,
         }
@@ -430,10 +457,13 @@ pub struct SequencerApp {
     /// the pattern view open (tap again to close); holding it and using a pattern pad closes it on release.
     patterns_down: bool,
     patterns_used: bool,
-    /// Probability page (Probability button, latched): the grid shows 8 steps as bars, top = 100 % ... bottom =
-    /// 12 %; prob_page = which 8 steps (0 = steps 1-8 ... 7 = steps 57-64).
+    /// Probability page (Probability button, latched): top two rows = 16 levels (100 % ... 6 %), rows 3-6 = the 32
+    /// steps of the page shown; prob_sel = the step whose level the top rows show and set.
     prob_view: bool,
-    prob_page: u8,
+    prob_sel: Option<u8>,
+    /// Pattern Settings page (latched): step pads set the length of the selected track's pattern (◀ / ▶ = steps
+    /// 1-32 / 33-64), the bottom row its step rate.
+    pset_view: bool,
     /// Per track: the pattern (index, contents) as it was before the first Mutate tap; a long press restores it.
     /// Kept in memory only (not saved); a new snapshot is taken when the track mutates a different pattern.
     mutate_orig: [Option<(u8, Pattern)>; TRACKS],
@@ -645,7 +675,8 @@ impl SequencerApp {
             patterns_down: false,
             patterns_used: false,
             prob_view: false,
-            prob_page: 0,
+            prob_sel: None,
+            pset_view: false,
             mutate_orig: [None; TRACKS],
             mutate_down_us: 0,
             mutate_long_done: false,
@@ -795,6 +826,7 @@ impl SequencerApp {
             t.pattern = t.chain_start;
             t.position = 0;
             t.playing_step = None;
+            t.resume_pulse = 0;
             t.apply_pending();
         }
         self.rng ^= now_us() as u32;
@@ -1004,7 +1036,9 @@ impl SequencerApp {
     fn play_step(&mut self, time: u64, step_us: u64, rate: u8) {
         let any_solo = self.tracks.iter().any(|t| t.solo);
         for t in 0..TRACKS {
-            if self.tracks[t].rate != rate {
+            if self.tracks[t].pat().rate != rate
+                || (self.tracks[t].resume_pulse.wrapping_sub(self.clock_count) as i32) > 0
+            {
                 continue;
             }
             let (pos, step, muted, output, channel, transpose) = {
@@ -1034,6 +1068,12 @@ impl SequencerApp {
             if tr.position == 0 {
                 tr.next_pattern();
                 tr.apply_pending();
+                if tr.pat().rate != rate {
+                    // The next pattern runs at another rate: it starts where this step ends (the next point on this
+                    // rate's grid), not at the new rate's next point, which may come sooner.
+                    let p = RATE_HALF_PULSES[rate as usize] / 2;
+                    tr.resume_pulse = (self.clock_count / p + 1) * p;
+                }
             }
         }
         self.dirty = true;
@@ -1125,7 +1165,7 @@ impl SequencerApp {
                 if n == note {
                     *slot = None;
                     // Held length in clock pulses (exact whatever the tempo or clock source), in eighths of a step.
-                    let step_256ths = RATE_HALF_PULSES[self.tracks[t as usize].rate as usize] as u64 * 128;
+                    let step_256ths = RATE_HALF_PULSES[self.tracks[t as usize].pat().rate as usize] as u64 * 128;
                     let held = pos.saturating_sub(start) * 8;
                     let gate = ((held + step_256ths / 2) / step_256ths).clamp(1, MAX_GATE as u64) as u8;
                     let s = &mut self.tracks[t as usize].pat_mut().steps[step as usize];
@@ -1336,7 +1376,11 @@ impl SequencerApp {
             if pad < 16 {
                 self.tracks[t].channel = pad as u8;
             } else if (RATE_PAD..RATE_PAD + RATE_HALF_PULSES.len()).contains(&pad) {
-                self.tracks[t].rate = (pad - RATE_PAD) as u8;
+                // Holding a track sets the rate of all its patterns (Pattern Settings sets one pattern's).
+                let r = (pad - RATE_PAD) as u8;
+                for pat in self.tracks[t].patterns.iter_mut() {
+                    pat.rate = r;
+                }
             }
             self.dirty = true;
             return;
@@ -1497,12 +1541,13 @@ impl SequencerApp {
         };
         let playing = self.playing;
         for tr in self.tracks.iter_mut() {
-            // A pattern with no notes yet is new: it takes the length of the track's current pattern.
-            let length = tr.pat().length;
+            // A pattern with no notes yet is new: it takes the length and rate of the track's current pattern.
+            let (length, rate) = (tr.pat().length, tr.pat().rate);
             for q in range.0..=range.1 {
                 let pat = &mut tr.patterns[q as usize];
                 if !pat.has_notes() {
                     pat.length = length;
+                    pat.rate = rate;
                 }
             }
             if playing {
@@ -1602,7 +1647,7 @@ impl SequencerApp {
             s[6] = tr.chain_start;
             s[7] = tr.chain_end;
             s[8] = tr.transpose as u8;
-            s[10] = RATE_HALF_PULSES[tr.rate as usize % RATE_HALF_PULSES.len()] as u8;
+            s[10] = RATE_HALF_PULSES[tr.pat().rate as usize % RATE_HALF_PULSES.len()] as u8; // for older firmware
             sink(&s);
         }
         let empty = step_bytes(&Step::OFF);
@@ -1617,6 +1662,13 @@ impl SequencerApp {
                         sink(&b);
                     }
                 }
+            }
+        }
+        // Extension (older firmware stops reading before it): each pattern's step rate, in half pulses per step.
+        sink(&project::RATES_MAGIC);
+        for tr in self.tracks.iter() {
+            for pat in tr.patterns.iter() {
+                sink(&[RATE_HALF_PULSES[pat.rate as usize % RATE_HALF_PULSES.len()] as u8]);
             }
         }
     }
@@ -1638,14 +1690,13 @@ impl SequencerApp {
                 tr.chain_start,
                 tr.chain_end,
                 tr.transpose as u8,
-                tr.rate,
             ]);
         }
         let mut h = crc.value();
         let mut mix = |w: u32| h = (h ^ w).wrapping_mul(0x0100_0193).rotate_left(5);
         for tr in self.tracks.iter() {
             for pat in tr.patterns.iter() {
-                mix(pat.length as u32);
+                mix(pat.length as u32 | (pat.rate as u32) << 8);
                 for st in pat.steps.iter() {
                     let n = &st.notes;
                     mix(u32::from_le_bytes([n[0], n[1], n[2], n[3]]));
@@ -1679,7 +1730,12 @@ impl SequencerApp {
         tr.chain_start = s[6] % patterns as u8;
         tr.chain_end = (s[7] % patterns as u8).max(tr.chain_start);
         tr.transpose = (s[8] as i8).clamp(-24, 24);
-        tr.rate = rate_from_saved(s[10], s[9]);
+        // Older projects have one rate per track: every pattern starts with it.
+        let rate = rate_from_saved(s[10], s[9]);
+        for pat in tr.patterns.iter_mut() {
+            pat.rate = rate;
+        }
+        tr.resume_pulse = 0;
         tr.queued = None;
         tr.position = 0;
         tr.playing_step = None;
@@ -1728,6 +1784,17 @@ impl SequencerApp {
                 }
             }
         }
+        // Per-pattern step rates (absent in projects saved before they existed: the track's rate stays).
+        let m = project::RATES_MAGIC.len();
+        if body.len() >= pos + m + TRACKS * PATTERNS && body[pos..pos + m] == project::RATES_MAGIC {
+            pos += m;
+            for tr in self.tracks.iter_mut() {
+                for pat in tr.patterns.iter_mut() {
+                    pat.rate = rate_from_saved(body[pos], 0);
+                    pos += 1;
+                }
+            }
+        }
         self.sync_patterns();
         true
     }
@@ -1742,7 +1809,7 @@ impl SequencerApp {
             Self::load_settings(tr, &rec[base..base + project::TRACK_SETTINGS], project::OLD_PATTERNS);
             for (p, pat) in tr.patterns.iter_mut().enumerate() {
                 if p >= project::OLD_PATTERNS {
-                    *pat = Pattern::EMPTY;
+                    *pat = Pattern { rate: pat.rate, ..Pattern::EMPTY };
                     continue;
                 }
                 let o = base + project::TRACK_SETTINGS + p * pattern_bytes;
@@ -1964,26 +2031,77 @@ impl SequencerApp {
                 led::set(top16_index(n), c);
             }
         } else if self.prob_view {
-            // 8 steps as bars, filled from the bottom up to the step's probability; off steps faint, steps past the
-            // pattern's end dark, the playing step white.
+            // Top two rows: the 16 levels (brighter = more likely), the selected step's level white. Rows 3-6: the
+            // steps, lit by how likely they are to play (off steps faint, the selected step white, the playing step
+            // in full colour). The bottom two rows are dark.
             let tr = &self.tracks[sel];
             let pat = tr.pat();
-            for col in 0..8u8 {
-                let step = self.prob_page * 8 + col;
-                let s = pat.steps[step as usize];
-                let playing = self.playing && tr.playing_step == Some(step);
-                for k in 0..8u8 {
-                    let c = if step >= pat.length {
-                        0
-                    } else if !s.on {
-                        0x060606
-                    } else if PROB_LEVELS[k as usize] <= s.prob {
-                        if playing { 0xFFFFFF } else { colour }
+            let sel_level = self
+                .prob_sel
+                .filter(|&st| st < pat.length && pat.steps[st as usize].on)
+                .map(|st| prob_level(pat.steps[st as usize].prob));
+            for lv in 0..16 {
+                let c = scale(0x00E0FF, 40 + PROB_LEVELS16[lv] as u32 * 216 / 100);
+                let c = match sel_level {
+                    Some(l) if l == lv => 0xFFFFFF,
+                    Some(_) => c,
+                    None => dim(c, 2),
+                };
+                led::set(prob_level_index(lv), c);
+            }
+            let first = self.page as usize * PAGE_STEPS;
+            for pad in 0..PAGE_STEPS {
+                let step = first + pad;
+                let st = pat.steps[step];
+                let c = if step >= pat.length as usize {
+                    0
+                } else if self.prob_sel == Some(step as u8) {
+                    0xFFFFFF
+                } else if self.playing && tr.playing_step == Some(step as u8) {
+                    colour
+                } else if st.on {
+                    scale(colour, 24 + st.prob as u32 * 120 / 100)
+                } else {
+                    0x080808
+                };
+                led::set(prob_step_index(pad), c);
+            }
+            for pad in 0..16 {
+                led::set(note_pad_index(pad), 0);
+            }
+        } else if self.pset_view {
+            // Length on the step pads (the last step white, the playhead in full colour), step rate on the bottom row.
+            let tr = &self.tracks[sel];
+            let pat = tr.pat();
+            let first = self.page as usize * PAGE_STEPS;
+            for pad in 0..PAGE_STEPS {
+                let step = first + pad;
+                let c = if step + 1 == pat.length as usize {
+                    0xFFFFFF
+                } else if step >= pat.length as usize {
+                    0x080808
+                } else if self.playing && tr.playing_step == Some(step as u8) {
+                    colour
+                } else {
+                    dim(colour, 3)
+                };
+                led::set(step_index(pad), c);
+            }
+            for pad in 0..32 {
+                let c = if pad < RATE_HALF_PULSES.len() {
+                    let triplet = RATE_HALF_PULSES[pad] % 3 != 0;
+                    let on = if triplet { 0xA040FF } else { 0x20FF40 };
+                    if pad as u8 == pat.rate {
+                        on
+                    } else if pad as u8 == DEFAULT_RATE {
+                        dim(on, 2)
                     } else {
-                        0x101010
-                    };
-                    led::set((8 - k) * 10 + col + 1, c);
-                }
+                        dim(on, 4)
+                    }
+                } else {
+                    0
+                };
+                led::set(note_pad_index(pad), c);
             }
         } else if let Some(t) = self.held_track {
             // Track settings: channel on steps 1-16, step rate on steps 17-24, outputs on note row 1.
@@ -1995,7 +2113,7 @@ impl SequencerApp {
                     // Straight rates green, triplets purple; the default (1/16) a little brighter when not chosen.
                     let triplet = RATE_HALF_PULSES[r as usize] % 3 != 0;
                     let on = if triplet { 0xA040FF } else { 0x20FF40 };
-                    if r == self.tracks[t].rate {
+                    if r == self.tracks[t].pat().rate {
                         on
                     } else if r == DEFAULT_RATE {
                         dim(on, 2)
@@ -2154,6 +2272,9 @@ impl SequencerApp {
                         0x200030
                     }
                 }
+                None if idx == BTN_PATTERN_SETTINGS => {
+                    if self.pset_view { 0xFF8000 } else { 0x281400 }
+                }
                 None if idx == BTN_PROBABILITY => {
                     if self.prob_view { 0x00E0FF } else { 0x002830 }
                 }
@@ -2201,12 +2322,6 @@ impl SequencerApp {
             };
             led::set(btn, c);
         }
-        if self.prob_view {
-            // ◀ / ▶ move 8 steps at a time: lit when there is more of the pattern that way.
-            let groups = (sel_len.max(1) as u8 - 1) / 8;
-            led::set(BTN_LEFT, if self.prob_page > 0 { 0xFFFFFF } else { 0x101010 });
-            led::set(BTN_RIGHT, if self.prob_page < groups { 0xFFFFFF } else { 0x101010 });
-        }
         led::set(BTN_UP, 0x202020);
         led::set(BTN_DOWN, 0x202020);
         led::set(BTN_CLEAR, if self.clear { 0xFF4040 } else { 0x200808 });
@@ -2250,6 +2365,7 @@ impl App for SequencerApp {
         self.patterns_held = false;
         self.patterns_down = false;
         self.prob_view = false;
+        self.pset_view = false;
         self.mutate_down_us = 0;
         self.pattern_hold = None;
         self.shift = false;
@@ -2276,15 +2392,41 @@ impl App for SequencerApp {
                 }
                 self.on_pattern_pad(p, event.pressed);
             }
+        } else if self.pset_view && is_grid(i) {
+            if event.pressed {
+                let tr = &mut self.tracks[self.selected];
+                if let Some(pad) = step_from_index(i) {
+                    let step = self.page as usize * PAGE_STEPS + pad;
+                    tr.pat_mut().length = step as u8 + 1;
+                    if tr.position > step as u8 {
+                        tr.position = 0;
+                    }
+                } else if let Some(pad) = note_pad_from_index(i).filter(|&p| p < RATE_HALF_PULSES.len()) {
+                    tr.pat_mut().rate = pad as u8;
+                }
+                self.dirty = true;
+            }
         } else if self.prob_view && is_grid(i) {
             if event.pressed {
-                let (row, col) = (i / 10, i % 10 - 1);
-                let step = (self.prob_page * 8 + col) as usize;
-                let s = &mut self.tracks[self.selected].pat_mut().steps[step];
-                if s.on {
-                    s.prob = PROB_LEVELS[(8 - row) as usize];
-                    self.dirty = true;
+                let (row, col) = ((i / 10) as usize, (i % 10) as usize - 1);
+                if row >= 7 {
+                    // A level: sets the selected step (if it is on).
+                    let lv = (8 - row) * 8 + col;
+                    let pat = self.tracks[self.selected].pat_mut();
+                    if let Some(st) = self.prob_sel.filter(|&st| st < pat.length) {
+                        if pat.steps[st as usize].on {
+                            pat.steps[st as usize].prob = PROB_LEVELS16[lv];
+                        }
+                    }
+                } else if (3..=6).contains(&row) {
+                    // A step: select it (only steps that are on and inside the pattern).
+                    let step = self.page as usize * PAGE_STEPS + (6 - row) * 8 + col;
+                    let pat = self.tracks[self.selected].pat();
+                    if step < pat.length as usize && pat.steps[step].on {
+                        self.prob_sel = Some(step as u8);
+                    }
                 }
+                self.dirty = true;
             }
         } else if let Some(step) = step_from_index(i) {
             self.on_step_pad(step, event.pressed);
@@ -2369,6 +2511,7 @@ impl App for SequencerApp {
                         self.pattern_hold = None;
                     }
                     self.prob_view = false;
+                    self.pset_view = false;
                     self.dirty = true;
                 }
                 BTN_MUTATE => {
@@ -2385,14 +2528,23 @@ impl App for SequencerApp {
                     self.dirty = true;
                 }
                 BTN_PROBABILITY if event.pressed => {
-                    // Tap: open / close the probability page, starting at the first 8 steps of the page shown.
+                    // Tap: open / close the probability page (on the step page shown; no step selected yet).
                     self.prob_view = !self.prob_view;
+                    self.prob_sel = None;
                     if self.prob_view {
+                        self.pset_view = false;
                         self.patterns_held = false;
                         self.pattern_hold = None;
-                        self.prob_page = self.page * 4;
-                    } else {
-                        self.page = self.prob_page / 4;
+                    }
+                    self.dirty = true;
+                }
+                BTN_PATTERN_SETTINGS if event.pressed => {
+                    // Tap: open / close the Pattern Settings page.
+                    self.pset_view = !self.pset_view;
+                    if self.pset_view {
+                        self.prob_view = false;
+                        self.patterns_held = false;
+                        self.pattern_hold = None;
                     }
                     self.dirty = true;
                 }
@@ -2400,15 +2552,6 @@ impl App for SequencerApp {
                 BTN_PLAY if event.pressed && self.shift => self.toggle_ext_ignore(),
                 BTN_PLAY if event.pressed => {
                     self.play_pressed();
-                }
-                BTN_LEFT if event.pressed && self.prob_view => {
-                    self.prob_page = self.prob_page.saturating_sub(1);
-                    self.dirty = true;
-                }
-                BTN_RIGHT if event.pressed && self.prob_view => {
-                    let len = self.tracks[self.selected].pat().length.max(1);
-                    self.prob_page = (self.prob_page + 1).min((len - 1) / 8);
-                    self.dirty = true;
                 }
                 BTN_LEFT if event.pressed => {
                     self.page = 0;

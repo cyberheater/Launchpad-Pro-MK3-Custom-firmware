@@ -9,6 +9,8 @@
 //   16   8 tracks x 16 bytes of settings (as below; pattern / chain bytes now count 0-15)
 //   144  for each track, for each of its 16 patterns: u8 length, u8 stored-step count n, then n x (u8 step
 //        index, 11 step bytes as below). A step is stored when it is on or differs from an empty step.
+//   then  "PR" + 8 tracks x 16 patterns x u8 step rate in half pulses per step (added later: older firmware stops
+//        reading before it; projects without it give every pattern the track's rate from its settings byte 10)
 //   end  u32 CRC-32 (IEEE) of everything before it
 // The older versions below hold 8 projects of 8 per-track patterns; they are converted once (see migration in mod.rs).
 // Version 5: 64 steps per pattern. 8 slots of 48 KB in the two gaps the older formats leave free: slots 0-3
@@ -175,6 +177,8 @@ pub fn available() -> bool {
 /// projects never set it, so they load on the internal clock. (Bit 0, "ignore external clock" in earlier builds, is
 /// no longer used.)
 pub const FLAG_FOLLOW_CLOCK: u8 = 0x02;
+/// Marks the per-pattern step-rate block after the patterns (version 6 records from v0.8 on).
+pub const RATES_MAGIC: [u8; 2] = *b"PR";
 
 fn valid(rec: &[u8; RECORD]) -> bool {
     let body = match rec[4] {
