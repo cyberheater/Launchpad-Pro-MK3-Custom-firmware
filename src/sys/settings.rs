@@ -15,10 +15,15 @@ const BASIC_SETTINGS_SIZE: usize = 7;
 const PALETTE_OFFSET: usize = SETTINGS_DATA_OFFSET + BASIC_SETTINGS_SIZE;
 const CUSTOM_PALETTE_BYTES: usize = 3 * 3 * 128;
 const SETTINGS_WIRE_SIZE: usize = PALETTE_OFFSET + CUSTOM_PALETTE_BYTES;
+// Extra settings stored after the CRC-checked image (so adding them keeps older images valid): a marker byte, then
+// the sequencer's count-in flag. Without the marker (an image saved by an older build) the defaults apply.
+const EXTRA_OFFSET: usize = SETTINGS_WIRE_SIZE;
+const EXTRA_MAGIC: u8 = 0xC1;
+const SETTINGS_STORED_SIZE: usize = EXTRA_OFFSET + 2;
 
 #[cfg(feature = "launchpad-pro-mk3")]
 const _: () = assert!(
-    SETTINGS_WIRE_SIZE
+    SETTINGS_STORED_SIZE
         <= crate::sys::driver::common::storage::external::SETTINGS_SIZE as usize
 );
 
@@ -31,6 +36,8 @@ pub struct Settings {
     pub aftertouch_curve: u8,
     pub palette: u8,
     pub mirror_enabled: u8,
+    /// Sequencer: one bar count-in (grid flashes red 4 times) before recording starts. 1 = on.
+    pub count_in: u8,
     pub custom_palette: [[[u8; 128]; 3]; 3],
 }
 
@@ -44,6 +51,7 @@ impl Settings {
             aftertouch_curve: 0,
             palette: 0,
             mirror_enabled: 0,
+            count_in: 0,
             custom_palette: [[[0; 128]; 3]; 3],
         }
     }
@@ -57,6 +65,7 @@ impl Settings {
             aftertouch_curve: 0,
             palette: 0,
             mirror_enabled: 0,
+            count_in: 1,
             custom_palette: [[[0; 128]; 3]; 3],
         }
     }
@@ -82,6 +91,9 @@ impl Settings {
         }
         if self.mirror_enabled > 1 {
             self.mirror_enabled = 0;
+        }
+        if self.count_in > 1 {
+            self.count_in = 1;
         }
     }
 
@@ -134,6 +146,10 @@ impl Settings {
 
         let crc = crc32(&out[SETTINGS_DATA_OFFSET..SETTINGS_WIRE_SIZE]);
         out[SETTINGS_CRC_OFFSET..SETTINGS_DATA_OFFSET].copy_from_slice(&crc.to_le_bytes());
+        if out.len() >= SETTINGS_STORED_SIZE {
+            out[EXTRA_OFFSET] = EXTRA_MAGIC;
+            out[EXTRA_OFFSET + 1] = self.count_in;
+        }
     }
 
     fn decode(input: &[u8]) -> Self {
@@ -155,6 +171,10 @@ impl Settings {
                     pos += 128;
                 }
             }
+        }
+
+        if input.len() >= SETTINGS_STORED_SIZE && input[EXTRA_OFFSET] == EXTRA_MAGIC {
+            settings.count_in = input[EXTRA_OFFSET + 1];
         }
 
         settings.sanitize();
@@ -196,9 +216,9 @@ pub fn load() {
     let flash_size = driver::flash_size() as usize;
     let read_len = min_usize(
         min_usize(flash_size, SETTINGS_FLASH_SIZE),
-        SETTINGS_WIRE_SIZE,
+        SETTINGS_STORED_SIZE,
     );
-    let mut buf = [0xff; SETTINGS_WIRE_SIZE];
+    let mut buf = [0xff; SETTINGS_STORED_SIZE];
 
     if read_len != 0 {
         driver::read_flash(0, &mut buf[..read_len]);
@@ -233,13 +253,13 @@ pub fn save() {
     let flash_size = driver::flash_size() as usize;
     let write_len = min_usize(
         min_usize(flash_size, SETTINGS_FLASH_SIZE),
-        SETTINGS_WIRE_SIZE,
+        SETTINGS_STORED_SIZE,
     );
     if write_len == 0 {
         return;
     }
 
-    let mut buf = [0; SETTINGS_WIRE_SIZE];
+    let mut buf = [0; SETTINGS_STORED_SIZE];
     with(|settings| settings.encode(&mut buf));
     driver::write_flash(0, &buf[..write_len]);
 }

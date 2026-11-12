@@ -30,10 +30,19 @@
 //                    there. + Clear held: clear that pattern.
 //   Hold Shift:      step pads show swing (pad 1 = 50 % straight ... pad 26 = 75 %); tap one to set it.
 //   Hold a step + Shift: right-hand column = probability bar (top = 100 % ... bottom = 12 %).
+//   Mutation (39)    tap: shuffle the selected track's part of the current pattern (about a quarter of its lit steps
+//                    move to another step or swap notes with another lit step; the button turns purple). Long press
+//                    (0.6 s): back to the part as it was before the first tap (the button flashes white). The
+//                    original is kept in memory only, per track, for the pattern last mutated.
+//   Probability (49) tap: probability page (button cyan; tap again to close): the grid shows 8 steps of the selected
+//                    track as bars (top = 100 % ... bottom = 12 %; off steps faint); tap a pad to set that step's
+//                    probability. ◀ / ▶ move 8 steps at a time (steps 1-8 ... 57-64).
 //   Hold a track button: note rows 2-4 = transpose (-12 ... +11 semitones; the dim pad is 0); steps 17-24 = step
 //                    rate, slowest left: 1/1, 1/4, 1/4T, 1/8, 1/8T, 1/16 (default), 1/16T, 1/32 (green = straight,
 //                    purple = triplet). Swing only applies to 1/16 tracks; other rates play straight.
-//   Play (20)        start / stop.        Shift (90) + Up / Down: tempo +1 / -1 BPM (+10 / -10 with Fixed Length held).
+//   Play (20)        start / stop. With Record armed and the count-in on (Setup page, pad 21), Play first counts
+//                    one bar in: the grid flashes red on 4 beats at the current tempo, then playback and recording
+//                    start (not while following an external clock; Play again during the count-in cancels it).        Shift (90) + Up / Down: tempo +1 / -1 BPM (+10 / -10 with Fixed Length held).
 //   Shift held:      the note area shows the tempo (orange bar = hundreds, then tens and units in white), and the
 //                    Sends button (its printed Shift label is "Tap") is tap tempo: tap it in time; the average of the
 //                    last few taps sets the BPM (a 2 s pause starts over; ignored while following an external clock).
@@ -42,7 +51,8 @@
 //                    probability); works across both pages.
 //   Clear (60) held + step pad: clear the step; + track button: clear the track's current pattern (its length stays).
 //   Note (94)        back to the note/performance app; playback continues there (Sequencer button lit green).
-//   Record (10)      tap: arm / disarm live recording (red). While armed and playing, notes played on the note pads or
+//   Record (10)      tap: arm / disarm live recording (red). Record Arm (bottom row, first button) does the same and
+//                    lights with it. While armed and playing, notes played on the note pads or
 //                    arriving on the USB MIDI port / DIN In (e.g. a keyboard) are written into the selected track's
 //                    current pattern at the nearest step, with their velocity and held length as the gate (a note held
 //                    over several steps keeps sounding for as long as it was held). A note recorded just ahead of a step is not replayed on that pass (you already heard it).
@@ -94,6 +104,12 @@ const BTN_PLAY: u8 = 20;
 const BTN_PROJECTS: u8 = 98;
 const BTN_RECORD: u8 = 10;
 const BTN_PATTERNS: u8 = 89;
+/// Right-hand column, 5th from the top (printed "Probability"): opens the probability page.
+const BTN_PROBABILITY: u8 = 49;
+/// Right-hand column, 6th from the top (printed "Mutation"): tap = shuffle the selected track's part, long press =
+/// back to how it was before the first shuffle.
+const BTN_MUTATE: u8 = 39;
+const MUTATE_LONG_US: u64 = 600_000;
 /// The "Sends" button under the track row: its printed Shift function is "Tap".
 const BTN_TAP: u8 = 6;
 /// Taps averaged for tap tempo, and the gap after which tapping starts over.
@@ -151,6 +167,8 @@ const RATE_PAD: usize = 16;
 const PAGE_STEPS: usize = 32;
 const BTN_LEFT: u8 = 91;
 /// Bottom row: Mute (2nd) and Solo (3rd) arm a mode in which the track buttons mute / solo tracks.
+/// Bottom row, first button (printed "Record Arm"): arms / disarms recording, like Record (10).
+const BTN_REC_ARM: u8 = 1;
 const BTN_MUTE: u8 = 2;
 const BTN_SOLO: u8 = 3;
 
@@ -412,6 +430,22 @@ pub struct SequencerApp {
     /// the pattern view open (tap again to close); holding it and using a pattern pad closes it on release.
     patterns_down: bool,
     patterns_used: bool,
+    /// Probability page (Probability button, latched): the grid shows 8 steps as bars, top = 100 % ... bottom =
+    /// 12 %; prob_page = which 8 steps (0 = steps 1-8 ... 7 = steps 57-64).
+    prob_view: bool,
+    prob_page: u8,
+    /// Per track: the pattern (index, contents) as it was before the first Mutate tap; a long press restores it.
+    /// Kept in memory only (not saved); a new snapshot is taken when the track mutates a different pattern.
+    mutate_orig: [Option<(u8, Pattern)>; TRACKS],
+    /// When Mutate was pressed (0 = not held), and whether this press has already restored (long press).
+    mutate_down_us: u64,
+    mutate_long_done: bool,
+    /// Mutate lights white until then after a restore.
+    mutate_flash_until: u64,
+    /// Count-in (Record armed + Play, when switched on in Setup): when it started (0 = none) and the last drawn
+    /// phase (beat * 2 + lit), so the grid redraws only when the flash changes.
+    count_in_start_us: u64,
+    count_in_phase: u8,
     /// Pattern pad held in the patterns view (a second one tapped meanwhile chains the range).
     pattern_hold: Option<u8>,
     dirty: bool,
@@ -610,6 +644,14 @@ impl SequencerApp {
             patterns_held: false,
             patterns_down: false,
             patterns_used: false,
+            prob_view: false,
+            prob_page: 0,
+            mutate_orig: [None; TRACKS],
+            mutate_down_us: 0,
+            mutate_long_done: false,
+            mutate_flash_until: 0,
+            count_in_start_us: 0,
+            count_in_phase: 0xFF,
             pattern_hold: None,
             dirty: true,
             switch: None,
@@ -652,6 +694,94 @@ impl SequencerApp {
         x ^= x << 5;
         self.rng = x;
         (x % 100) as u8 + 1
+    }
+
+    /// Random number below n (n > 0).
+    fn random_below(&mut self, n: usize) -> usize {
+        self.random_percent();
+        (self.rng % n as u32) as usize
+    }
+
+    // ---------------- mutate ----------------
+
+    /// Mutate tap: rearranges the selected track's part of the current pattern. About one in four of its lit steps
+    /// (at least one) is either moved to another step (swapping places with whatever is there) or swaps its notes
+    /// with another lit step, so the part keeps the same hits and notes in a new arrangement. The part as it was
+    /// before the first tap is kept for a long press to restore.
+    fn mutate(&mut self) {
+        let t = self.selected;
+        let index = self.tracks[t].pattern;
+        let mut pat = *self.tracks[t].pat();
+        let len = pat.length.clamp(1, STEPS as u8) as usize;
+        let mut lit = [0u8; STEPS];
+        let mut n = 0;
+        for (i, st) in pat.steps[..len].iter().enumerate() {
+            if st.on {
+                lit[n] = i as u8;
+                n += 1;
+            }
+        }
+        if n == 0 || len < 2 {
+            return;
+        }
+        if !matches!(self.mutate_orig[t], Some((p, _)) if p == index) {
+            self.mutate_orig[t] = Some((index, pat));
+        }
+        for _ in 0..(n / 4).max(1) {
+            // Positions of lit steps change as we go: pick a currently lit step each time.
+            let on: usize = pat.steps[..len].iter().filter(|st| st.on).count();
+            let mut k = self.random_below(on);
+            let a = pat.steps[..len].iter().position(|st| {
+                if st.on {
+                    if k == 0 {
+                        return true;
+                    }
+                    k -= 1;
+                }
+                false
+            });
+            let Some(a) = a else { break };
+            if on >= 2 && self.random_percent() <= 50 {
+                // Swap notes with another lit step (rhythm stays, melody changes).
+                let mut k = self.random_below(on - 1);
+                let b = pat.steps[..len].iter().enumerate().position(|(i, st)| {
+                    if st.on && i != a {
+                        if k == 0 {
+                            return true;
+                        }
+                        k -= 1;
+                    }
+                    false
+                });
+                if let Some(b) = b {
+                    let notes = pat.steps[a].notes;
+                    pat.steps[a].notes = pat.steps[b].notes;
+                    pat.steps[b].notes = notes;
+                }
+            } else {
+                // Move the step to another position, swapping with what is there.
+                let mut b = self.random_below(len - 1);
+                if b >= a {
+                    b += 1;
+                }
+                pat.steps.swap(a, b);
+            }
+        }
+        *self.tracks[t].pat_mut() = pat;
+        self.dirty = true;
+    }
+
+    /// Mutate long press: back to the part as it was before the first tap (if the track is still on that pattern).
+    fn mutate_restore(&mut self) {
+        let t = self.selected;
+        if let Some((index, pat)) = self.mutate_orig[t] {
+            if index == self.tracks[t].pattern {
+                *self.tracks[t].pat_mut() = pat;
+                self.mutate_orig[t] = None;
+                self.mutate_flash_until = now_us() + 300_000;
+            }
+        }
+        self.dirty = true;
     }
 
     // ---------------- transport ----------------
@@ -944,6 +1074,9 @@ impl SequencerApp {
 
     /// Writes a played note into the selected track at the nearest step (if recording).
     fn record_note_on(&mut self, note: u8, velocity: u8) {
+        if self.count_in_start_us != 0 {
+            return;
+        }
         if self.record_armed && !self.playing {
             self.step_record_note_on(note, velocity);
             return;
@@ -1054,8 +1187,63 @@ impl SequencerApp {
         self.step_rec_notes = [NO_NOTE; MAX_NOTES];
     }
 
+    /// Record (10) or Record Arm (bottom row 1): arm / disarm recording.
+    fn toggle_record(&mut self) {
+        self.record_armed = !self.record_armed;
+        self.step_record_reset();
+        if self.record_armed && !self.playing {
+            self.page = 0;
+        }
+        self.dirty = true;
+    }
+
     fn step_recording(&self) -> bool {
-        self.record_armed && !self.playing
+        self.record_armed && !self.playing && self.count_in_start_us == 0
+    }
+
+    // ---------------- count-in ----------------
+
+    /// One bar of four beats at the current tempo.
+    fn beat_us(&self) -> u64 {
+        60_000_000 / self.bpm.max(1) as u64
+    }
+
+    /// Play pressed while stopped: with Record armed, the count-in switched on in Setup and no external clock
+    /// running, count one bar in (the grid flashes red on each beat) and start on the next downbeat; otherwise
+    /// start at once.
+    fn play_pressed(&mut self) {
+        if self.playing {
+            self.stop();
+        } else if self.count_in_start_us != 0 {
+            self.count_in_start_us = 0; // Play again during the count-in cancels it
+            self.dirty = true;
+        } else if self.record_armed && !self.ext_active && crate::sys::settings::get().count_in != 0 {
+            self.step_record_reset();
+            self.count_in_start_us = now_us().max(1);
+            self.count_in_phase = 0xFF;
+            self.dirty = true;
+        } else {
+            self.start();
+        }
+    }
+
+    fn run_count_in(&mut self, now: u64) {
+        if self.count_in_start_us == 0 {
+            return;
+        }
+        let beat = self.beat_us();
+        let elapsed = now.saturating_sub(self.count_in_start_us);
+        if elapsed >= 4 * beat {
+            self.count_in_start_us = 0;
+            self.start();
+            return;
+        }
+        // Lit for the first 40 % of each beat.
+        let phase = (elapsed / beat) as u8 * 2 + ((elapsed % beat) < beat * 2 / 5) as u8;
+        if phase != self.count_in_phase {
+            self.count_in_phase = phase;
+            self.dirty = true;
+        }
     }
 
     // ---------------- MIDI thru ----------------
@@ -1367,6 +1555,7 @@ impl SequencerApp {
         #[cfg(feature = "launchpad-s-and-mini-common")]
         TICK_US.fetch_add(1000, core::sync::atomic::Ordering::Relaxed);
         let now = now_us();
+        self.run_count_in(now);
         self.run_clock(now);
         if let Some((due, len)) = self.pending_step {
             if !self.playing {
@@ -1673,6 +1862,7 @@ impl SequencerApp {
     fn load_slot(&mut self, slot: usize) {
         let slot = slot % project::SLOTS;
         self.slot = slot;
+        self.mutate_orig = [None; TRACKS]; // originals belong to the project being left
         let was_playing = self.playing;
         if self.playing {
             self.stop();
@@ -1742,7 +1932,13 @@ impl SequencerApp {
         let sel = self.selected;
         let colour = TRACK_COLOURS[sel];
 
-        if self.patterns_held || self.projects_held {
+        if self.count_in_start_us != 0 {
+            // Count-in: the whole grid flashes red on each beat.
+            let c = if self.count_in_phase & 1 != 0 { 0xFF0000 } else { 0 };
+            for n in 0..64 {
+                led::set(top16_index(n), c);
+            }
+        } else if self.patterns_held || self.projects_held {
             // Top rows: the 16 patterns (two rows) or 32 projects (four rows); the rest of the grid dark.
             let shown = if self.projects_held { project::SLOTS } else { PATTERNS };
             for n in 0..64 {
@@ -1766,6 +1962,28 @@ impl SequencerApp {
                     }
                 };
                 led::set(top16_index(n), c);
+            }
+        } else if self.prob_view {
+            // 8 steps as bars, filled from the bottom up to the step's probability; off steps faint, steps past the
+            // pattern's end dark, the playing step white.
+            let tr = &self.tracks[sel];
+            let pat = tr.pat();
+            for col in 0..8u8 {
+                let step = self.prob_page * 8 + col;
+                let s = pat.steps[step as usize];
+                let playing = self.playing && tr.playing_step == Some(step);
+                for k in 0..8u8 {
+                    let c = if step >= pat.length {
+                        0
+                    } else if !s.on {
+                        0x060606
+                    } else if PROB_LEVELS[k as usize] <= s.prob {
+                        if playing { 0xFFFFFF } else { colour }
+                    } else {
+                        0x101010
+                    };
+                    led::set((8 - k) * 10 + col + 1, c);
+                }
             }
         } else if let Some(t) = self.held_track {
             // Track settings: channel on steps 1-16, step rate on steps 17-24, outputs on note row 1.
@@ -1891,6 +2109,9 @@ impl SequencerApp {
         let flash = |on: u32, queued: bool| if self.blink { on } else if queued { 0xFFFFFF } else { dim(on, 4) };
         for n in 1..=8u8 {
             let c = match n {
+                BTN_REC_ARM => {
+                    if self.record_armed { if self.playing { 0xFF0000 } else { 0xA00000 } } else { 0x200000 }
+                }
                 BTN_MUTE => match self.arm {
                     Arm::Mute { queued } => flash(0xFF0000, queued),
                     _ => 0x300000,
@@ -1923,6 +2144,18 @@ impl SequencerApp {
                 }
                 None if idx == BTN_PATTERNS => {
                     if self.patterns_held { 0xFFFFFF } else { 0x303030 }
+                }
+                None if idx == BTN_MUTATE => {
+                    if self.mutate_flash_until != 0 {
+                        0xFFFFFF
+                    } else if matches!(self.mutate_orig[sel], Some((p, _)) if p == self.tracks[sel].pattern) {
+                        0xC000FF // mutated: a long press restores
+                    } else {
+                        0x200030
+                    }
+                }
+                None if idx == BTN_PROBABILITY => {
+                    if self.prob_view { 0x00E0FF } else { 0x002830 }
                 }
                 None => 0,
             };
@@ -1968,6 +2201,12 @@ impl SequencerApp {
             };
             led::set(btn, c);
         }
+        if self.prob_view {
+            // ◀ / ▶ move 8 steps at a time: lit when there is more of the pattern that way.
+            let groups = (sel_len.max(1) as u8 - 1) / 8;
+            led::set(BTN_LEFT, if self.prob_page > 0 { 0xFFFFFF } else { 0x101010 });
+            led::set(BTN_RIGHT, if self.prob_page < groups { 0xFFFFFF } else { 0x101010 });
+        }
         led::set(BTN_UP, 0x202020);
         led::set(BTN_DOWN, 0x202020);
         led::set(BTN_CLEAR, if self.clear { 0xFF4040 } else { 0x200808 });
@@ -2010,6 +2249,8 @@ impl App for SequencerApp {
         self.projects_held = false;
         self.patterns_held = false;
         self.patterns_down = false;
+        self.prob_view = false;
+        self.mutate_down_us = 0;
         self.pattern_hold = None;
         self.shift = false;
         self.clear = false;
@@ -2034,6 +2275,16 @@ impl App for SequencerApp {
                     self.patterns_used = true;
                 }
                 self.on_pattern_pad(p, event.pressed);
+            }
+        } else if self.prob_view && is_grid(i) {
+            if event.pressed {
+                let (row, col) = (i / 10, i % 10 - 1);
+                let step = (self.prob_page * 8 + col) as usize;
+                let s = &mut self.tracks[self.selected].pat_mut().steps[step];
+                if s.on {
+                    s.prob = PROB_LEVELS[(8 - row) as usize];
+                    self.dirty = true;
+                }
             }
         } else if let Some(step) = step_from_index(i) {
             self.on_step_pad(step, event.pressed);
@@ -2062,6 +2313,10 @@ impl App for SequencerApp {
                 self.tracks[self.selected].pat_mut().steps[step as usize].gate = i;
                 self.step_edited = true;
                 self.dirty = true;
+            }
+        } else if i == BTN_REC_ARM {
+            if event.pressed {
+                self.toggle_record();
             }
         } else if i == BTN_TAP && self.shift {
             if event.pressed {
@@ -2113,19 +2368,47 @@ impl App for SequencerApp {
                         self.patterns_held = false;
                         self.pattern_hold = None;
                     }
+                    self.prob_view = false;
                     self.dirty = true;
                 }
-                BTN_RECORD if event.pressed => {
-                    self.record_armed = !self.record_armed;
-                    self.step_record_reset();
-                    if self.record_armed && !self.playing {
-                        self.page = 0;
+                BTN_MUTATE => {
+                    // Tap (released before MUTATE_LONG_US) = shuffle; long press = restore (done in on_tick).
+                    if event.pressed {
+                        self.mutate_down_us = now_us().max(1);
+                        self.mutate_long_done = false;
+                    } else if self.mutate_down_us != 0 {
+                        if !self.mutate_long_done {
+                            self.mutate();
+                        }
+                        self.mutate_down_us = 0;
                     }
                     self.dirty = true;
                 }
+                BTN_PROBABILITY if event.pressed => {
+                    // Tap: open / close the probability page, starting at the first 8 steps of the page shown.
+                    self.prob_view = !self.prob_view;
+                    if self.prob_view {
+                        self.patterns_held = false;
+                        self.pattern_hold = None;
+                        self.prob_page = self.page * 4;
+                    } else {
+                        self.page = self.prob_page / 4;
+                    }
+                    self.dirty = true;
+                }
+                BTN_RECORD if event.pressed => self.toggle_record(),
                 BTN_PLAY if event.pressed && self.shift => self.toggle_ext_ignore(),
                 BTN_PLAY if event.pressed => {
-                    if self.playing { self.stop() } else { self.start() }
+                    self.play_pressed();
+                }
+                BTN_LEFT if event.pressed && self.prob_view => {
+                    self.prob_page = self.prob_page.saturating_sub(1);
+                    self.dirty = true;
+                }
+                BTN_RIGHT if event.pressed && self.prob_view => {
+                    let len = self.tracks[self.selected].pat().length.max(1);
+                    self.prob_page = (self.prob_page + 1).min((len - 1) / 8);
+                    self.dirty = true;
                 }
                 BTN_LEFT if event.pressed => {
                     self.page = 0;
@@ -2181,6 +2464,14 @@ impl App for SequencerApp {
 
     fn on_tick(&mut self) {
         self.run_engine();
+        if self.mutate_down_us != 0 && !self.mutate_long_done && now_us().saturating_sub(self.mutate_down_us) >= MUTATE_LONG_US {
+            self.mutate_long_done = true;
+            self.mutate_restore();
+        }
+        if self.mutate_flash_until != 0 && now_us() >= self.mutate_flash_until {
+            self.mutate_flash_until = 0;
+            self.dirty = true;
+        }
         let blink = (now_us() / 250_000) % 2 == 0;
         let pending = self.tracks.iter().any(|t| t.pending_mute || t.pending_solo);
         if blink != self.blink && (self.arm != Arm::Off || pending) {

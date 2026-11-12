@@ -16,6 +16,8 @@ const DAW_BUTTON: u8 = 12;
 const PALETTE_RAINBOW_BUTTON: u8 = 25;
 const CUSTOM_PALETTE_START: u8 = 26;
 const SYSTEM_PALETTE_START: u8 = 15;
+/// Sequencer count-in on / off (second row from the bottom, first pad): bright red = on.
+const COUNT_IN_BUTTON: u8 = 21;
 
 pub struct InitPage {
     text: Text,
@@ -96,6 +98,10 @@ impl InitPage {
         );
     }
 
+    fn draw_count_in(&self) {
+        led::set(COUNT_IN_BUTTON, if crate::sys::settings::get().count_in != 0 { 0xff2000 } else { 0x200400 });
+    }
+
     fn draw_palette_selector(&self) {
         #[cfg(feature = "rgb-color")]
         {
@@ -162,6 +168,7 @@ impl Page for InitPage {
         led::set(57, 0x100000);
         self.draw_mode_selector();
         self.draw_palette_selector();
+        self.draw_count_in();
     }
 
     fn on_surface(&mut self, event: SurfaceEvent) {
@@ -181,6 +188,10 @@ impl Page for InitPage {
             PROGRAMMER_BUTTON => {
                 self.selected_mode = Some(AppId::Programmer);
                 self.draw_mode_selector();
+            }
+            COUNT_IN_BUTTON => {
+                crate::sys::settings::update(|s| s.count_in = if s.count_in != 0 { 0 } else { 1 });
+                self.draw_count_in();
             }
             #[cfg(feature = "rgb-color")]
             15..=18 => self.set_palette(event.index - SYSTEM_PALETTE_START),
