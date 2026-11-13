@@ -24,7 +24,8 @@
 //   Patterns (89)    tap: latch the pattern view open (white; tap again to close); or hold it, use the pattern
 //                    pads and let go (closes on release). Open: the top two grid rows show the project's 16 patterns (1-8 on the top row, 9-16 below).
 //                    A pattern holds all 8 tracks and every track is on the same pattern: current = white, chained =
-//                    orange, has notes = dim orange, queued = cyan. Tap a pattern to switch to it (at the end of the
+//                    orange, the selected track has notes = dim orange (only other tracks:
+//                    fainter), queued = cyan. Tap a pattern to switch to it (at the end of the
 //                    playing pattern, or at once when stopped; an empty pattern takes the length of the current one);
 //                    hold one and tap another to chain the range. + Duplicate (50) held: copy the current pattern
 //                    there. + Clear held: clear that pattern.
@@ -2193,8 +2194,10 @@ impl SequencerApp {
                         0xFFFFFF
                     } else if tr.chain_end > tr.chain_start && (tr.chain_start..=tr.chain_end).contains(&p) {
                         0xFF8000
+                    } else if self.tracks[sel].patterns[n].has_notes() {
+                        0x301400 // the selected track has notes here
                     } else if self.tracks.iter().any(|t| t.patterns[n].has_notes()) {
-                        0x301400
+                        0x0C0500 // only other tracks have notes here
                     } else {
                         0x050505
                     }
