@@ -102,6 +102,7 @@ use crate::driver;
 use crate::sys::led;
 use crate::sys::midi::MidiPort;
 
+mod arp;
 mod project;
 
 const TRACKS: usize = project::TRACKS;
@@ -125,6 +126,9 @@ const BTN_PATTERNS: u8 = 89;
 const BTN_PROBABILITY: u8 = 49;
 /// Right-hand column: Pattern Settings (latched page: the selected track's pattern length and step rate).
 const BTN_PATTERN_SETTINGS: u8 = 69;
+/// Right-hand column, 2nd from the top (printed "Steps"): the Arp page.
+const BTN_ARP: u8 = 79;
+const ARP_COLOUR: u32 = 0x40FF40;
 /// Right-hand column, bottom (printed "Print to Clip"): the Programs page.
 const BTN_PROGRAMS: u8 = 19;
 /// Bottom row, 7th (printed "Device"): on the Programs page, edits the project slot instead of a track.
@@ -500,6 +504,15 @@ pub struct SequencerApp {
     /// Programs page (latched): prog_global = editing the project slot (else the selected track's); prog_group =
     /// which 32 programs the bottom four rows show.
     prog_view: bool,
+    /// Arp page (Steps button, latched): row 8 = latch (pad 1) and arp on / off (pad 8), row 7 = play order, row 6 =
+    /// octaves 1-4, row 5 = step time (1/4 ... 1/32T, pad 5 = 1/16). The note pads stay playable below it.
+    arp_view: bool,
+    arp: arp::Arp,
+    /// Arp settings read from the Setup storage yet / changed since (saved when the page closes).
+    arp_loaded: bool,
+    arp_changed: bool,
+    /// The arp note last written while recording (its note-off is recorded when the next one plays).
+    arp_rec: Option<u8>,
     prog_global: bool,
     prog_group: u8,
     /// Program changes sent on project selection: the project slot, then one per track.
@@ -729,6 +742,11 @@ impl SequencerApp {
             prob_sel: None,
             pset_view: false,
             prog_view: false,
+            arp_view: false,
+            arp: arp::Arp::new(),
+            arp_loaded: false,
+            arp_changed: false,
+            arp_rec: None,
             prog_global: false,
             prog_group: 0,
             prog_project: Prog::NONE,
@@ -1172,6 +1190,141 @@ impl SequencerApp {
         }
     }
 
+    // ---------------- arpeggiator ----------------
+
+    /// Reads the arp settings saved with the Setup settings (once).
+    fn arp_load(&mut self) {
+        if self.arp_loaded {
+            return;
+        }
+        self.arp_loaded = true;
+        let st = crate::sys::settings::get();
+        self.arp.latch = st.arp_latch != 0;
+        self.arp.mode = st.arp_mode.min(arp::MODES - 1);
+        self.arp.octaves = st.arp_octaves.clamp(1, arp::MAX_OCTAVES);
+        self.arp.rate = st.arp_rate.min(arp::RATE_QP.len() as u8 - 1);
+    }
+
+    /// Saves changed arp settings (latch, play order, octaves, step time; on / off is not kept).
+    fn arp_save(&mut self) {
+        if !self.arp_changed {
+            return;
+        }
+        self.arp_changed = false;
+        let a = self.arp;
+        crate::sys::settings::update(|s| {
+            s.arp_latch = a.latch as u8;
+            s.arp_mode = a.mode;
+            s.arp_octaves = a.octaves;
+            s.arp_rate = a.rate;
+        });
+        crate::sys::settings::save();
+    }
+
+    /// Closes the Arp page (saving its settings).
+    fn close_arp_view(&mut self) {
+        if self.arp_view {
+            self.arp_view = false;
+            self.arp_save();
+        }
+    }
+
+    /// One arp step in microseconds at the current tempo (or the external clock's).
+    fn arp_step_us(&self) -> u64 {
+        let interval = if self.ext_active { self.ext_interval_us } else { self.clock_interval_us() };
+        interval * arp::RATE_QP[self.arp.rate as usize] as u64 / 4
+    }
+
+    /// Arp step number at `now` while playing: steps counted on the sequencer's clock, so the arp lines up with it.
+    fn arp_clock_idx(&self, now: u64) -> u64 {
+        self.clock_pos(now) / (arp::RATE_QP[self.arp.rate as usize] as u64 * 64)
+    }
+
+    /// A key for the arp (note pad or keyboard). The first key starts it at once.
+    fn arp_key(&mut self, note: u8, velocity: u8, pressed: bool) {
+        if pressed {
+            if self.arp.press(note, velocity.max(1)) {
+                let now = now_us();
+                self.arp.last_idx = self.arp_clock_idx(now);
+                self.arp.next_us = now + self.arp_step_us();
+                self.arp_fire(now);
+            }
+        } else {
+            self.arp.release(note);
+            if !self.arp.active() {
+                self.arp_rec_end();
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn arp_rec_end(&mut self) {
+        if let Some(n) = self.arp_rec.take() {
+            self.record_note_off(n);
+        }
+    }
+
+    /// Plays the arp's next note on the selected track (and records it when recording).
+    fn arp_fire(&mut self, now: u64) {
+        let mut rng = self.rng;
+        let next = self.arp.next(&mut |n| {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            (rng % n as u32) as usize
+        });
+        self.rng = rng;
+        let Some((note, velocity)) = next else { return };
+        let tr = &self.tracks[self.selected];
+        let (output, channel) = (tr.output, tr.channel);
+        let gate = (self.arp_step_us() * 3 / 4).max(5_000);
+        self.note_off_now(output, channel, note);
+        send(output, &[0x90 | channel, note, velocity]);
+        self.schedule_off(NoteOff { due_us: now + gate, sent_us: now, output, channel, note });
+        self.arp_rec_end();
+        self.record_note_on(note, velocity);
+        self.arp_rec = Some(note);
+    }
+
+    fn run_arp(&mut self, now: u64) {
+        if !self.arp.active() {
+            return;
+        }
+        if self.playing {
+            let idx = self.arp_clock_idx(now);
+            if idx != self.arp.last_idx {
+                self.arp.last_idx = idx;
+                self.arp_fire(now);
+            }
+        } else if now >= self.arp.next_us {
+            let step = self.arp_step_us();
+            self.arp.next_us = if now - self.arp.next_us > step { now + step } else { self.arp.next_us + step };
+            self.arp_fire(now);
+        }
+    }
+
+    /// A pad of the Arp page's top four rows.
+    fn on_arp_pad(&mut self, i: u8) {
+        let (row, col) = ((i / 10) as u8, (i % 10) as u8 - 1);
+        match row {
+            8 if col == 0 => {
+                let latch = !self.arp.latch;
+                self.arp.set_latch(latch);
+            }
+            8 if col == 7 => {
+                self.arp.on = !self.arp.on;
+                self.arp.clear();
+                self.arp_rec_end();
+            }
+            7 if col < arp::MODES => self.arp.mode = col,
+            6 if col < arp::MAX_OCTAVES => self.arp.octaves = col + 1,
+            5 => self.arp.rate = col,
+            _ => return,
+        }
+        self.arp_changed = true;
+        self.dirty = true;
+    }
+
     // ---------------- live recording ----------------
 
     /// Writes a played note into the selected track at the nearest step (if recording).
@@ -1505,6 +1658,14 @@ impl SequencerApp {
         }
         let sel = self.selected;
         let note = (self.tracks[sel].base as usize + pad).min(127) as u8;
+        if self.arp.on && self.held_step.is_none() {
+            // Arp on: the pad goes to the arpeggiator instead of sounding itself.
+            if pressed {
+                self.tracks[sel].note = note;
+            }
+            self.arp_key(note, value.max(1).min(127), pressed);
+            return;
+        }
         if pressed {
             if let Some(step) = self.held_step {
                 let s = &mut self.tracks[sel].pat_mut().steps[step as usize];
@@ -1664,6 +1825,7 @@ impl SequencerApp {
         let now = now_us();
         self.run_count_in(now);
         self.run_clock(now);
+        self.run_arp(now);
         if let Some((due, len)) = self.pending_step {
             if !self.playing {
                 self.pending_step = None;
@@ -2240,6 +2402,42 @@ impl SequencerApp {
             for pad in 0..16 {
                 led::set(note_pad_index(pad), 0);
             }
+        } else if self.arp_view {
+            // Arp page: rows 8-5 = settings; the note area below as usual, the arp's notes lit.
+            let a = &self.arp;
+            for n in 0..32usize {
+                let (row, col) = (n / 8, (n % 8) as u8);
+                let c = match row {
+                    0 if col == 0 => if a.latch { 0xFF8000 } else { 0x281400 },
+                    0 if col == 7 => if a.on { ARP_COLOUR } else { dim(ARP_COLOUR, 4) },
+                    1 if col < arp::MODES => if a.mode == col { 0x00E0FF } else { 0x002830 },
+                    2 if col < arp::MAX_OCTAVES => {
+                        if a.octaves == col + 1 { 0xFFE000 } else if col < a.octaves { 0x403800 } else { 0x100E00 }
+                    }
+                    3 => {
+                        let on = if arp::rate_is_triplet(col) { 0xA040FF } else { 0x20FF40 };
+                        if a.rate == col { on } else if col == arp::DEFAULT_RATE { dim(on, 2) } else { dim(on, 4) }
+                    }
+                    _ => 0,
+                };
+                led::set(top16_index(n), c);
+            }
+            let track = &self.tracks[sel];
+            for pad in 0..32 {
+                let note = track.base as usize + pad;
+                let c = if note > 127 {
+                    0
+                } else if self.arp.on && self.arp.has(note as u8) {
+                    colour
+                } else if note % 12 == 0 {
+                    0x303060
+                } else if matches!(note % 12, 1 | 3 | 6 | 8 | 10) {
+                    0x040404
+                } else {
+                    0x141414
+                };
+                led::set(note_pad_index(pad), c);
+            }
         } else if self.prog_view {
             // Programs: rows 8-7 = channel, row 6 = banks, row 5 = output and which 32 programs, rows 4-1 = the 32
             // programs of that group in reading order (row 4 = the first 8, program 1 top left). The chosen ones bright (the program white).
@@ -2478,6 +2676,9 @@ impl SequencerApp {
                 None if idx == BTN_PROBABILITY => {
                     if self.prob_view { 0x00E0FF } else { 0x002830 }
                 }
+                None if idx == BTN_ARP => {
+                    if self.arp_view { ARP_COLOUR } else if self.arp.on { dim(ARP_COLOUR, 2) } else { dim(ARP_COLOUR, 5) }
+                }
                 None if idx == BTN_PROGRAMS => {
                     if self.prog_view { PROG_COLOUR } else { dim(PROG_COLOUR, 4) }
                 }
@@ -2557,6 +2758,7 @@ impl App for SequencerApp {
         if !self.loaded {
             self.load_initial();
         }
+        self.arp_load();
         self.held_step = None;
         self.held_track = None;
         self.dirty = true;
@@ -2576,6 +2778,7 @@ impl App for SequencerApp {
         self.prob_view = false;
         self.pset_view = false;
         self.prog_view = false;
+        self.close_arp_view();
         self.mutate_down_us = 0;
         self.pattern_hold = None;
         self.shift = false;
@@ -2601,6 +2804,10 @@ impl App for SequencerApp {
                     self.patterns_used = true;
                 }
                 self.on_pattern_pad(p, event.pressed);
+            }
+        } else if self.arp_view && is_grid(i) && i / 10 >= 5 {
+            if event.pressed {
+                self.on_arp_pad(i);
             }
         } else if self.prog_view && is_grid(i) {
             if event.pressed {
@@ -2755,6 +2962,7 @@ impl App for SequencerApp {
                     self.prob_view = !self.prob_view;
                     self.prob_sel = None;
                     if self.prob_view {
+                        self.close_arp_view();
                         self.pset_view = false;
                         self.prog_view = false;
                         self.patterns_held = false;
@@ -2766,7 +2974,22 @@ impl App for SequencerApp {
                     // Tap: open / close the Pattern Settings page.
                     self.pset_view = !self.pset_view;
                     if self.pset_view {
+                        self.close_arp_view();
                         self.prob_view = false;
+                        self.prog_view = false;
+                        self.patterns_held = false;
+                        self.pattern_hold = None;
+                    }
+                    self.dirty = true;
+                }
+                BTN_ARP if event.pressed => {
+                    // Tap: open / close the Arp page.
+                    if self.arp_view {
+                        self.close_arp_view();
+                    } else {
+                        self.arp_view = true;
+                        self.prob_view = false;
+                        self.pset_view = false;
                         self.prog_view = false;
                         self.patterns_held = false;
                         self.pattern_hold = None;
@@ -2778,6 +3001,7 @@ impl App for SequencerApp {
                     self.prog_view = !self.prog_view;
                     self.prog_global = false;
                     if self.prog_view {
+                        self.close_arp_view();
                         self.prob_view = false;
                         self.pset_view = false;
                         self.patterns_held = false;
@@ -2830,6 +3054,18 @@ impl App for SequencerApp {
         let (kind, channel) = (event.status & 0xF0, event.status & 0x0F);
         let note = event.data1 & 0x7F;
         match kind {
+            0x90 if event.data2 > 0 && self.arp.on => {
+                if !self.is_echo(channel, note) {
+                    self.arp_key(note, event.data2, true);
+                }
+            }
+            0x80 | 0x90 if self.arp.on => {
+                if self.thru_note_off(note) {
+                    self.record_note_off(note); // a key that went down before the arp was switched on
+                } else {
+                    self.arp_key(note, 0, false);
+                }
+            }
             0x90 if event.data2 > 0 => {
                 if self.thru_note_on(channel, note, event.data2) {
                     self.record_note_on(note, event.data2);
