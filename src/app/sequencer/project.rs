@@ -3,7 +3,7 @@
 // Sequencer project storage in the driver's user storage area.
 //
 // Version 6 (current): 32 projects of up to 30 KB at offset 0 (project n at n * SLOT_SIZE), current-project record
-// at META6_OFFSET. 16 song-wide patterns (every track is on the same pattern), and only the steps that are in use
+// at META6_OFFSET. 16 patterns per track (each track plays and chains its own), and only the steps that are in use
 // are stored, so a project normally takes a few KB:
 //   0    "LPS6", u8 version 6, u16 bpm, u8 swing, u8 flags, u32 record length (incl. CRC), 3 reserved = 16 bytes
 //   16   8 tracks x 16 bytes of settings (as below; pattern / chain bytes now count 0-15)
@@ -179,9 +179,7 @@ pub fn available() -> bool {
 pub const FLAG_FOLLOW_CLOCK: u8 = 0x02;
 /// Marks the per-pattern step-rate block after the patterns (version 6 records from v0.8 on).
 pub const RATES_MAGIC: [u8; 2] = *b"PR";
-/// Marks the program-change block after the rates (from v0.9): project slot (output, channel, bank, program), then
-/// bank and program per track; 0xFF = none.
-pub const PROGS_MAGIC: [u8; 2] = *b"PG";
+// v0.9 wrote a program-change block ("PG") after the rates; it is no longer written and is ignored on load.
 
 fn valid(rec: &[u8; RECORD]) -> bool {
     let body = match rec[4] {
