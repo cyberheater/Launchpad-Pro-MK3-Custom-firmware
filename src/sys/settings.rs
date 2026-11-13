@@ -22,7 +22,10 @@ const SETTINGS_WIRE_SIZE: usize = PALETTE_OFFSET + CUSTOM_PALETTE_BYTES;
 const EXTRA_OFFSET: usize = SETTINGS_WIRE_SIZE;
 const EXTRA_MAGIC: u8 = 0xC1;
 const CLOCK_OUT_OFF: u8 = 1;
-const SETTINGS_STORED_SIZE: usize = EXTRA_OFFSET + 3;
+// Then the sequencer's arpeggiator: a marker byte and latch, mode, octaves, rate (defaults without the marker).
+const ARP_OFFSET: usize = EXTRA_OFFSET + 3;
+const ARP_MAGIC: u8 = 0xA1;
+const SETTINGS_STORED_SIZE: usize = ARP_OFFSET + 5;
 
 #[cfg(feature = "launchpad-pro-mk3")]
 const _: () = assert!(
@@ -43,6 +46,11 @@ pub struct Settings {
     pub count_in: u8,
     /// Sequencer: send MIDI clock, start, continue and stop to USB and both DIN outs. 1 = on.
     pub clock_out: u8,
+    /// Sequencer arpeggiator: latch (1 = on), play order (0-4), octaves (1-4), step time (0-7, 4 = 1/16).
+    pub arp_latch: u8,
+    pub arp_mode: u8,
+    pub arp_octaves: u8,
+    pub arp_rate: u8,
     pub custom_palette: [[[u8; 128]; 3]; 3],
 }
 
@@ -58,6 +66,10 @@ impl Settings {
             mirror_enabled: 0,
             count_in: 0,
             clock_out: 0,
+            arp_latch: 0,
+            arp_mode: 0,
+            arp_octaves: 1,
+            arp_rate: 4,
             custom_palette: [[[0; 128]; 3]; 3],
         }
     }
@@ -73,6 +85,10 @@ impl Settings {
             mirror_enabled: 0,
             count_in: 1,
             clock_out: 1,
+            arp_latch: 0,
+            arp_mode: 0,
+            arp_octaves: 1,
+            arp_rate: 4,
             custom_palette: [[[0; 128]; 3]; 3],
         }
     }
@@ -104,6 +120,18 @@ impl Settings {
         }
         if self.clock_out > 1 {
             self.clock_out = 1;
+        }
+        if self.arp_latch > 1 {
+            self.arp_latch = 0;
+        }
+        if self.arp_mode > 4 {
+            self.arp_mode = 0;
+        }
+        if !(1..=4).contains(&self.arp_octaves) {
+            self.arp_octaves = 1;
+        }
+        if self.arp_rate > 7 {
+            self.arp_rate = 4;
         }
     }
 
@@ -160,6 +188,11 @@ impl Settings {
             out[EXTRA_OFFSET] = EXTRA_MAGIC;
             out[EXTRA_OFFSET + 1] = self.count_in;
             out[EXTRA_OFFSET + 2] = if self.clock_out == 0 { CLOCK_OUT_OFF } else { 0 };
+            out[ARP_OFFSET] = ARP_MAGIC;
+            out[ARP_OFFSET + 1] = self.arp_latch;
+            out[ARP_OFFSET + 2] = self.arp_mode;
+            out[ARP_OFFSET + 3] = self.arp_octaves;
+            out[ARP_OFFSET + 4] = self.arp_rate;
         }
     }
 
@@ -187,6 +220,12 @@ impl Settings {
         if input.len() >= SETTINGS_STORED_SIZE && input[EXTRA_OFFSET] == EXTRA_MAGIC {
             settings.count_in = input[EXTRA_OFFSET + 1];
             settings.clock_out = if input[EXTRA_OFFSET + 2] == CLOCK_OUT_OFF { 0 } else { 1 };
+            if input[ARP_OFFSET] == ARP_MAGIC {
+                settings.arp_latch = input[ARP_OFFSET + 1];
+                settings.arp_mode = input[ARP_OFFSET + 2];
+                settings.arp_octaves = input[ARP_OFFSET + 3];
+                settings.arp_rate = input[ARP_OFFSET + 4];
+            }
         }
 
         settings.sanitize();
