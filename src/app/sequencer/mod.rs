@@ -668,6 +668,11 @@ fn step_from_bytes(s: &[u8], notes: usize) -> Step {
     st
 }
 
+/// The Setup page's Clock Out switch: send MIDI clock, start, continue and stop (on by default).
+fn clock_out_enabled() -> bool {
+    crate::sys::settings::with(|s| s.clock_out != 0)
+}
+
 fn send_all(data: &[u8]) {
     driver::send_midi(MidiPort::Midi, data);
     driver::send_midi(MidiPort::Din, data);
@@ -883,8 +888,12 @@ impl SequencerApp {
     }
 
     /// Transport/clock bytes: to every output when we are the clock master; when following an external clock only
-    /// to the DIN outputs (passing the clock on), never back to USB where it may have come from.
+    /// to the DIN outputs (passing the clock on), never back to USB where it may have come from. Nothing is sent when
+    /// Clock Out is switched off in Setup.
     fn send_transport(&self, byte: u8) {
+        if !clock_out_enabled() {
+            return;
+        }
         self.note_rt_sent(byte);
         if self.ext_active {
             driver::send_midi(MidiPort::Din, &[byte]);
@@ -1070,8 +1079,10 @@ impl SequencerApp {
         }
         while now >= self.next_clock_us {
             let pulse_time = self.next_clock_us;
-            self.note_rt_sent(0xF8);
-            send_all(&[0xF8]);
+            if clock_out_enabled() {
+                self.note_rt_sent(0xF8);
+                send_all(&[0xF8]);
+            }
             self.pulse(pulse_time, interval);
             self.next_clock_us += interval;
         }

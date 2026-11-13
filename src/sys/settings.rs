@@ -16,10 +16,13 @@ const PALETTE_OFFSET: usize = SETTINGS_DATA_OFFSET + BASIC_SETTINGS_SIZE;
 const CUSTOM_PALETTE_BYTES: usize = 3 * 3 * 128;
 const SETTINGS_WIRE_SIZE: usize = PALETTE_OFFSET + CUSTOM_PALETTE_BYTES;
 // Extra settings stored after the CRC-checked image (so adding them keeps older images valid): a marker byte, then
-// the sequencer's count-in flag. Without the marker (an image saved by an older build) the defaults apply.
+// the sequencer's count-in flag, then its clock-out-off flag. Without the marker (an image saved by an older build)
+// the defaults apply. The clock-out byte is stored inverted (1 = off) so that an image saved before it existed, where
+// the byte is still erased flash (0xff) or zero, keeps the clock on.
 const EXTRA_OFFSET: usize = SETTINGS_WIRE_SIZE;
 const EXTRA_MAGIC: u8 = 0xC1;
-const SETTINGS_STORED_SIZE: usize = EXTRA_OFFSET + 2;
+const CLOCK_OUT_OFF: u8 = 1;
+const SETTINGS_STORED_SIZE: usize = EXTRA_OFFSET + 3;
 
 #[cfg(feature = "launchpad-pro-mk3")]
 const _: () = assert!(
@@ -38,6 +41,8 @@ pub struct Settings {
     pub mirror_enabled: u8,
     /// Sequencer: one bar count-in (grid flashes red 4 times) before recording starts. 1 = on.
     pub count_in: u8,
+    /// Sequencer: send MIDI clock, start, continue and stop to USB and both DIN outs. 1 = on.
+    pub clock_out: u8,
     pub custom_palette: [[[u8; 128]; 3]; 3],
 }
 
@@ -52,6 +57,7 @@ impl Settings {
             palette: 0,
             mirror_enabled: 0,
             count_in: 0,
+            clock_out: 0,
             custom_palette: [[[0; 128]; 3]; 3],
         }
     }
@@ -66,6 +72,7 @@ impl Settings {
             palette: 0,
             mirror_enabled: 0,
             count_in: 1,
+            clock_out: 1,
             custom_palette: [[[0; 128]; 3]; 3],
         }
     }
@@ -94,6 +101,9 @@ impl Settings {
         }
         if self.count_in > 1 {
             self.count_in = 1;
+        }
+        if self.clock_out > 1 {
+            self.clock_out = 1;
         }
     }
 
@@ -149,6 +159,7 @@ impl Settings {
         if out.len() >= SETTINGS_STORED_SIZE {
             out[EXTRA_OFFSET] = EXTRA_MAGIC;
             out[EXTRA_OFFSET + 1] = self.count_in;
+            out[EXTRA_OFFSET + 2] = if self.clock_out == 0 { CLOCK_OUT_OFF } else { 0 };
         }
     }
 
@@ -175,6 +186,7 @@ impl Settings {
 
         if input.len() >= SETTINGS_STORED_SIZE && input[EXTRA_OFFSET] == EXTRA_MAGIC {
             settings.count_in = input[EXTRA_OFFSET + 1];
+            settings.clock_out = if input[EXTRA_OFFSET + 2] == CLOCK_OUT_OFF { 0 } else { 1 };
         }
 
         settings.sanitize();

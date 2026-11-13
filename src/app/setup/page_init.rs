@@ -18,6 +18,8 @@ const CUSTOM_PALETTE_START: u8 = 26;
 const SYSTEM_PALETTE_START: u8 = 15;
 /// Sequencer count-in on / off (second row from the bottom, first pad): bright red = on.
 const COUNT_IN_BUTTON: u8 = 21;
+/// Sequencer MIDI clock out on / off (second row from the bottom, second pad): bright green = on.
+const CLOCK_OUT_BUTTON: u8 = 22;
 
 pub struct InitPage {
     text: Text,
@@ -102,6 +104,10 @@ impl InitPage {
         led::set(COUNT_IN_BUTTON, if crate::sys::settings::get().count_in != 0 { 0xff2000 } else { 0x200400 });
     }
 
+    fn draw_clock_out(&self) {
+        led::set(CLOCK_OUT_BUTTON, if crate::sys::settings::get().clock_out != 0 { 0x00ff20 } else { 0x002004 });
+    }
+
     fn draw_palette_selector(&self) {
         #[cfg(feature = "rgb-color")]
         {
@@ -169,6 +175,7 @@ impl Page for InitPage {
         self.draw_mode_selector();
         self.draw_palette_selector();
         self.draw_count_in();
+        self.draw_clock_out();
     }
 
     fn on_surface(&mut self, event: SurfaceEvent) {
@@ -192,6 +199,10 @@ impl Page for InitPage {
             COUNT_IN_BUTTON => {
                 crate::sys::settings::update(|s| s.count_in = if s.count_in != 0 { 0 } else { 1 });
                 self.draw_count_in();
+            }
+            CLOCK_OUT_BUTTON => {
+                crate::sys::settings::update(|s| s.clock_out = if s.clock_out != 0 { 0 } else { 1 });
+                self.draw_clock_out();
             }
             #[cfg(feature = "rgb-color")]
             15..=18 => self.set_palette(event.index - SYSTEM_PALETTE_START),
