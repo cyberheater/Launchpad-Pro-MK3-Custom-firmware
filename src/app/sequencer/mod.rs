@@ -22,12 +22,13 @@
 //                    eighths of a step (1 = shortest, 8 = whole step; a longer recorded note shows all 8); a lit step tapped and released without an edit
 //                    turns off. Step brightness follows velocity.
 //   Patterns (89)    tap: latch the pattern view open (white; tap again to close); or hold it, use the pattern
-//                    pads and let go (closes on release). Open: the top two grid rows show the project's 16 patterns (1-8 on the top row, 9-16 below).
-//                    A pattern holds all 8 tracks and every track is on the same pattern: current = white, chained =
-//                    orange, has notes = dim orange, queued = cyan. Tap a pattern to switch to it (at the end of the
-//                    playing pattern, or at once when stopped; an empty pattern takes the length of the current one);
-//                    hold one and tap another to chain the range. + Duplicate (50) held: copy the current pattern
-//                    there. + Clear held: clear that pattern.
+//                    pads and let go (closes on release). Open: the top two grid rows show the selected track's 16 patterns (1-8 on the
+//                    top row, 9-16 below). Each track has its own patterns and plays and chains them on its own:
+//                    current = white, chained = orange, has notes = dim orange, queued = cyan. Tap a pattern to switch
+//                    the selected track to it (at the end of its playing pattern, or at once when stopped; an empty
+//                    pattern takes the length of the current one); hold one and tap another to chain the range.
+//                    + Duplicate (50) held: copy the current pattern there. + Clear held: clear that pattern.
+//                    With Shift held, a pattern pad (switch, chain, copy, clear) acts on every track at once.
 //   Hold Shift:      step pads show swing (pad 1 = 50 % straight ... pad 26 = 75 %); tap one to set it.
 //   Hold a step + Shift: right-hand column = probability bar (top = 100 % ... bottom = 12 %).
 //   Mutation (39)    tap: shuffle the selected track's part of the current pattern (about a quarter of its lit steps
@@ -1572,7 +1573,7 @@ impl SequencerApp {
         self.dirty = true;
     }
 
-    /// A pattern pad in the patterns view. Patterns are song-wide: every track switches together.
+    /// A pattern pad in the patterns view: acts on the selected track (every track with Shift).
     fn on_pattern_pad(&mut self, p: u8, pressed: bool) {
         let p = p.min(PATTERNS as u8 - 1);
         if !pressed {
@@ -1582,14 +1583,16 @@ impl SequencerApp {
             return;
         }
         self.dirty = true;
+        // Each track has its own 16 patterns: a pattern pad acts on the selected track, or on every track with Shift.
+        let (first, last) = if self.shift { (0, TRACKS) } else { (self.selected, self.selected + 1) };
         if self.duplicate {
-            for tr in self.tracks.iter_mut() {
+            for tr in self.tracks[first..last].iter_mut() {
                 tr.patterns[p as usize] = *tr.pat();
             }
             return;
         }
         if self.clear {
-            for tr in self.tracks.iter_mut() {
+            for tr in self.tracks[first..last].iter_mut() {
                 tr.patterns[p as usize].clear();
             }
             return;
@@ -1602,7 +1605,7 @@ impl SequencerApp {
             }
         };
         let playing = self.playing;
-        for tr in self.tracks.iter_mut() {
+        for tr in self.tracks[first..last].iter_mut() {
             // A pattern with no notes yet is new: it takes the length and rate of the track's current pattern.
             let (length, rate) = (tr.pat().length, tr.pat().rate);
             for q in range.0..=range.1 {
@@ -1815,14 +1818,6 @@ impl SequencerApp {
         tr.playing_step = None;
     }
 
-    /// Every track on track 1's pattern and chain (patterns are song-wide).
-    fn sync_patterns(&mut self) {
-        let (p, a, b) = (self.tracks[0].pattern, self.tracks[0].chain_start, self.tracks[0].chain_end);
-        for tr in self.tracks.iter_mut() {
-            (tr.pattern, tr.chain_start, tr.chain_end, tr.queued) = (p, a, b, None);
-        }
-    }
-
     /// Loads a version-6 record of `len` bytes (CRC already checked). False if it is malformed.
     fn load_record6(&mut self, rec: &[u8], len: usize) -> bool {
         let body = &rec[..len - 4];
@@ -1882,7 +1877,6 @@ impl SequencerApp {
                 }
             }
         }
-        self.sync_patterns();
         true
     }
 
@@ -1912,7 +1906,6 @@ impl SequencerApp {
                 }
             }
         }
-        self.sync_patterns();
     }
 
     /// Imports a version-1 (single pattern) record into pattern 1 of each track.
@@ -2185,7 +2178,7 @@ impl SequencerApp {
                 } else if self.projects_held {
                     if n == self.slot { 0xFFFFFF } else if self.slot_saved[n] { 0x303030 } else { 0x050505 }
                 } else {
-                    let tr = &self.tracks[0];
+                    let tr = &self.tracks[sel];
                     let p = n as u8;
                     if tr.queued.map_or(false, |(a, b)| (a..=b).contains(&p)) {
                         0x00FFFF
@@ -2193,7 +2186,7 @@ impl SequencerApp {
                         0xFFFFFF
                     } else if tr.chain_end > tr.chain_start && (tr.chain_start..=tr.chain_end).contains(&p) {
                         0xFF8000
-                    } else if self.tracks.iter().any(|t| t.patterns[n].has_notes()) {
+                    } else if tr.patterns[n].has_notes() {
                         0x301400
                     } else {
                         0x050505
