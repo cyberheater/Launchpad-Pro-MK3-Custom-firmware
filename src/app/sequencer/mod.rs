@@ -44,7 +44,8 @@
 //                    chain moves to a pattern at another rate, it starts where the last step of the one before ends.
 //   Print to Clip (19) tap: Programs page - the program changes sent when a project is selected (button
 //                    yellow; tap again to close). It edits the selected track's slot, or the project slot (Device (7) on the bottom row;
-//                    track buttons go back to tracks). Rows 1-4 = 32 programs (row 1 = the first 8); ▲ / ▼ = the
+//                    track buttons go back to tracks). Rows 4-1 = 32 programs (row 4 = the first 8,
+//                    program 1 top left, counting along each row then down); ▲ / ▼ = the
 //                    next / previous 32 (1-32 ... 97-128, shown on row 5 pads 5-8, which also select). Row 5 pads 1-4
 //                    = output (USB, DIN 1, DIN 2, DIN 1+2), row 6 = bank 0-7 (sent as CC 32 before the program
 //                    change), rows 8-7 = MIDI channel 1-16. Tap the lit program or bank again for none.
@@ -578,6 +579,11 @@ fn now_us() -> u64 {
 
 fn step_index(step: usize) -> u8 {
     ((8 - step / 8) * 10 + step % 8 + 1) as u8
+}
+
+/// Programs page: program n (0-31 within the group) -> grid index, in reading order: n = 0 top left of rows 4..1.
+fn prog_pad_index(n: usize) -> u8 {
+    ((4 - n / 8) * 10 + n % 8 + 1) as u8
 }
 
 fn note_pad_index(pad: usize) -> u8 {
@@ -2132,7 +2138,7 @@ impl SequencerApp {
         let mut send_now = false;
         match row {
             1..=4 => {
-                let n = self.prog_group * 32 + ((row - 1) * 8 + col) as u8;
+                let n = self.prog_group * 32 + ((4 - row) * 8 + col) as u8;
                 let t = self.prog_target_mut();
                 t.program = if t.program == n { PROG_NONE } else { n };
                 send_now = true;
@@ -2235,14 +2241,14 @@ impl SequencerApp {
                 led::set(note_pad_index(pad), 0);
             }
         } else if self.prog_view {
-            // Programs: rows 8-7 = channel, row 6 = banks, row 5 = output and which 32 programs, rows 1-4 = the 32
-            // programs of that group (row 1 = the first 8). The chosen ones bright (the program white).
+            // Programs: rows 8-7 = channel, row 6 = banks, row 5 = output and which 32 programs, rows 4-1 = the 32
+            // programs of that group in reading order (row 4 = the first 8, program 1 top left). The chosen ones bright (the program white).
             let t = self.prog_target();
             let c_on = if self.prog_global { PROG_COLOUR } else { colour };
             for n in 0..32usize {
                 let prog = self.prog_group * 32 + n as u8;
                 let c = if prog == t.program { 0xFFFFFF } else { dim(c_on, 4) };
-                led::set(note_pad_index(n), c);
+                led::set(prog_pad_index(n), c);
             }
             for col in 0..8usize {
                 let c = if col < 4 {
