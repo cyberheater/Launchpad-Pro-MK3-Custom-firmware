@@ -42,6 +42,16 @@
 //                    tap a step pad to make it the last step (◀ / ▶ = steps 1-32 / 33-64); the bottom note row sets
 //                    the pattern's step rate (same order and colours as below). Each pattern has its own rate; when a
 //                    chain moves to a pattern at another rate, it starts where the last step of the one before ends.
+//   Print to Clip (19) tap: Programs page - the program changes sent when a project is selected (button
+//                    yellow; tap again to close). It edits the selected track's slot, or the project slot (Device (7) on the bottom row;
+//                    track buttons go back to tracks). Rows 1-4 = 32 programs (row 1 = the first 8); ▲ / ▼ = the
+//                    next / previous 32 (1-32 ... 97-128, shown on row 5 pads 5-8, which also select). Row 5 pads 1-4
+//                    = output (USB, DIN 1, DIN 2, DIN 1+2), row 6 = bank 0-7 (sent as CC 32 before the program
+//                    change), rows 8-7 = MIDI channel 1-16. Tap the lit program or bank again for none.
+//                    Choosing a program or bank sends it at once. A track slot uses the track's own output and
+//                    channel; the project slot has its own (e.g. a synth's global channel, to select a performance)
+//                    and is sent first. Selecting a project (or tapping the current one again in the Projects grid)
+//                    sends every slot with a program; identical messages are sent once.
 //   Hold a track button: note rows 2-4 = transpose (-12 ... +11 semitones; the dim pad is 0); steps 17-24 = step
 //                    rate of all the track's patterns, slowest left: 1/1, 1/4, 1/4T, 1/8, 1/8T, 1/16 (default),
 //                    1/16T, 1/32 (green = straight, purple = triplet). Swing only applies at 1/16; other rates play
@@ -114,6 +124,28 @@ const BTN_PATTERNS: u8 = 89;
 const BTN_PROBABILITY: u8 = 49;
 /// Right-hand column: Pattern Settings (latched page: the selected track's pattern length and step rate).
 const BTN_PATTERN_SETTINGS: u8 = 69;
+/// Right-hand column, bottom (printed "Print to Clip"): the Programs page.
+const BTN_PROGRAMS: u8 = 19;
+/// Bottom row, 7th (printed "Device"): on the Programs page, edits the project slot instead of a track.
+const BTN_DEVICE: u8 = 7;
+const PROG_COLOUR: u32 = 0xFFD000;
+/// "None" for a program or bank.
+const PROG_NONE: u8 = 0xFF;
+
+/// A program change sent when a project is selected: bank (CC 32 value) then program, both PROG_NONE = off. Track
+/// slots use the track's output and channel; the project slot uses its own.
+#[derive(Copy, Clone, PartialEq)]
+struct Prog {
+    output: Output,
+    channel: u8,
+    bank: u8,
+    program: u8,
+}
+
+impl Prog {
+    const NONE: Prog = Prog { output: Output::Din1, channel: 15, bank: PROG_NONE, program: PROG_NONE };
+}
+
 /// Right-hand column, 6th from the top (printed "Mutation"): tap = shuffle the selected track's part, long press =
 /// back to how it was before the first shuffle.
 const BTN_MUTATE: u8 = 39;
@@ -464,6 +496,14 @@ pub struct SequencerApp {
     /// Pattern Settings page (latched): step pads set the length of the selected track's pattern (◀ / ▶ = steps
     /// 1-32 / 33-64), the bottom row its step rate.
     pset_view: bool,
+    /// Programs page (latched): prog_global = editing the project slot (else the selected track's); prog_group =
+    /// which 32 programs the bottom four rows show.
+    prog_view: bool,
+    prog_global: bool,
+    prog_group: u8,
+    /// Program changes sent on project selection: the project slot, then one per track.
+    prog_project: Prog,
+    progs: [Prog; TRACKS],
     /// Per track: the pattern (index, contents) as it was before the first Mutate tap; a long press restores it.
     /// Kept in memory only (not saved); a new snapshot is taken when the track mutates a different pattern.
     mutate_orig: [Option<(u8, Pattern)>; TRACKS],
@@ -677,6 +717,11 @@ impl SequencerApp {
             prob_view: false,
             prob_sel: None,
             pset_view: false,
+            prog_view: false,
+            prog_global: false,
+            prog_group: 0,
+            prog_project: Prog::NONE,
+            progs: [Prog::NONE; TRACKS],
             mutate_orig: [None; TRACKS],
             mutate_down_us: 0,
             mutate_long_done: false,
@@ -1671,6 +1716,13 @@ impl SequencerApp {
                 sink(&[RATE_HALF_PULSES[pat.rate as usize % RATE_HALF_PULSES.len()] as u8]);
             }
         }
+        // Extension: program changes (project slot: output, channel, bank, program; then bank, program per track).
+        sink(&project::PROGS_MAGIC);
+        let p = self.prog_project;
+        sink(&[Output::ALL.iter().position(|o| *o == p.output).unwrap_or(1) as u8, p.channel, p.bank, p.program]);
+        for p in self.progs.iter() {
+            sink(&[p.bank, p.program]);
+        }
     }
 
     /// Fingerprint of the song, for the Projects LED (unsaved changes) and to tell whether switching project needs a
@@ -1691,6 +1743,11 @@ impl SequencerApp {
                 tr.chain_end,
                 tr.transpose as u8,
             ]);
+        }
+        let p = self.prog_project;
+        crc.update(&[p.output as u8, p.channel, p.bank, p.program]);
+        for p in self.progs.iter() {
+            crc.update(&[p.bank, p.program]);
         }
         let mut h = crc.value();
         let mut mix = |w: u32| h = (h ^ w).wrapping_mul(0x0100_0193).rotate_left(5);
@@ -1757,6 +1814,7 @@ impl SequencerApp {
             return false;
         }
         self.load_header(body);
+        self.reset_programs();
         for (t, tr) in self.tracks.iter_mut().enumerate() {
             let o = project::HEADER + t * project::TRACK_SETTINGS;
             Self::load_settings(tr, &body[o..o + project::TRACK_SETTINGS], PATTERNS);
@@ -1794,6 +1852,18 @@ impl SequencerApp {
                     pos += 1;
                 }
             }
+            // Program changes (absent before v0.9: none are sent).
+            let m = project::PROGS_MAGIC.len();
+            if body.len() >= pos + m + 4 + TRACKS * 2 && body[pos..pos + m] == project::PROGS_MAGIC {
+                pos += m;
+                let b = &body[pos..];
+                let byte = |v: u8| if v <= 127 { v } else { PROG_NONE };
+                self.prog_project =
+                    Prog { output: Output::ALL[(b[0] as usize).min(3)], channel: b[1] & 0x0f, bank: byte(b[2]), program: byte(b[3]) };
+                for (t, p) in self.progs.iter_mut().enumerate() {
+                    *p = Prog { bank: byte(b[4 + t * 2]), program: byte(b[5 + t * 2]), ..Prog::NONE };
+                }
+            }
         }
         self.sync_patterns();
         true
@@ -1802,6 +1872,7 @@ impl SequencerApp {
     /// Loads an old (version 2-5) record: its 8 per-track patterns become patterns 1-8.
     fn load_record(&mut self, rec: &[u8; project::RECORD]) {
         self.load_header(rec);
+        self.reset_programs();
         // Notes stored per step: 1 in version 2, 4 in version 3, 8 from version 4; 32 steps per pattern before version 5.
         let (step_bytes, pattern_bytes, track_bytes, stored_notes, stored_steps) = project::layout(rec[4]);
         for (t, tr) in self.tracks.iter_mut().enumerate() {
@@ -1832,6 +1903,7 @@ impl SequencerApp {
         self.bpm = u16::from_le_bytes([rec[5], rec[6]]).clamp(30, 300);
         self.swing = 50;
         self.ext_ignore = true;
+        self.reset_programs();
         for (t, tr) in self.tracks.iter_mut().enumerate() {
             let b = &rec[8 + t * project::V1_TRACK_BYTES..8 + (t + 1) * project::V1_TRACK_BYTES];
             *tr = Track::new(t as u8);
@@ -1850,8 +1922,14 @@ impl SequencerApp {
         }
     }
 
+    fn reset_programs(&mut self) {
+        self.prog_project = Prog::NONE;
+        self.progs = [Prog::NONE; TRACKS];
+    }
+
     /// A new, empty project.
     fn load_blank(&mut self) {
+        self.reset_programs();
         for (t, tr) in self.tracks.iter_mut().enumerate() {
             *tr = Track::new(t as u8);
         }
@@ -1880,7 +1958,7 @@ impl SequencerApp {
             None => self.migrate(),
         };
         self.scan_slots();
-        self.load_slot(slot);
+        self.load_slot(slot, false);
     }
 
     /// One-time conversion of the old projects (8 slots of 8 per-track patterns, spread over the 1 MB area) into
@@ -1926,7 +2004,7 @@ impl SequencerApp {
     }
 
     /// Opens project `slot` (a blank project if it is empty) and makes it the current one.
-    fn load_slot(&mut self, slot: usize) {
+    fn load_slot(&mut self, slot: usize, send_programs: bool) {
         let slot = slot % project::SLOTS;
         self.slot = slot;
         self.mutate_orig = [None; TRACKS]; // originals belong to the project being left
@@ -1943,6 +2021,9 @@ impl SequencerApp {
         }
         // A new, untouched project counts as saved: switching away from it does not store an empty project.
         self.saved_crc = self.current_crc();
+        if send_programs {
+            self.send_programs(); // before playback restarts, so the first notes hear the new sounds
+        }
         if was_playing {
             self.start();
         }
@@ -1952,12 +2033,13 @@ impl SequencerApp {
     /// Projects grid: save the current project if it changed, then open `slot`.
     fn switch_project(&mut self, slot: usize) {
         if slot == self.slot {
+            self.send_programs(); // tapping the current project again re-sends its program changes
             return;
         }
         if self.current_crc() != self.saved_crc {
             self.save();
         }
-        self.load_slot(slot);
+        self.load_slot(slot, true);
         project::set_current6(self.slot);
     }
 
@@ -1989,6 +2071,78 @@ impl SequencerApp {
             self.saved_crc = crc;
             self.save_flash_until = now_us() + 400_000;
             project::set_current6(self.slot);
+        }
+        self.dirty = true;
+    }
+
+    /// The slot the Programs page edits, with the output and channel it is sent on.
+    fn prog_target(&self) -> Prog {
+        if self.prog_global {
+            self.prog_project
+        } else {
+            let tr = &self.tracks[self.selected];
+            Prog { output: tr.output, channel: tr.channel, ..self.progs[self.selected] }
+        }
+    }
+
+    fn prog_target_mut(&mut self) -> &mut Prog {
+        if self.prog_global { &mut self.prog_project } else { &mut self.progs[self.selected] }
+    }
+
+    /// Bank (CC 32) then program change, if a program is set.
+    fn send_prog(p: Prog) {
+        if p.program > 127 {
+            return;
+        }
+        if p.bank <= 127 {
+            send(p.output, &[0xB0 | p.channel, 32, p.bank]);
+        }
+        send(p.output, &[0xC0 | p.channel, p.program]);
+    }
+
+    /// Sends the project slot, then each track's program; an identical message is sent only once.
+    fn send_programs(&self) {
+        let mut sent: [Option<Prog>; TRACKS + 1] = [None; TRACKS + 1];
+        let all = core::iter::once(self.prog_project).chain(
+            self.tracks.iter().zip(self.progs.iter()).map(|(tr, p)| Prog { output: tr.output, channel: tr.channel, ..*p }),
+        );
+        for (k, p) in all.enumerate() {
+            if p.program > 127 || sent.iter().flatten().any(|q| *q == p) {
+                continue;
+            }
+            sent[k] = Some(p);
+            Self::send_prog(p);
+        }
+    }
+
+    /// A pad on the Programs page.
+    fn on_prog_pad(&mut self, i: u8) {
+        let (row, col) = ((i / 10) as usize, (i % 10) as usize - 1);
+        let mut send_now = false;
+        match row {
+            1..=4 => {
+                let n = self.prog_group * 32 + ((row - 1) * 8 + col) as u8;
+                let t = self.prog_target_mut();
+                t.program = if t.program == n { PROG_NONE } else { n };
+                send_now = true;
+            }
+            5 if col < 4 => {
+                let o = Output::ALL[col];
+                if self.prog_global { self.prog_project.output = o } else { self.tracks[self.selected].output = o }
+            }
+            5 => self.prog_group = (col - 4) as u8,
+            6 => {
+                let t = self.prog_target_mut();
+                t.bank = if t.bank == col as u8 { PROG_NONE } else { col as u8 };
+                send_now = true;
+            }
+            _ => {
+                let ch = ((8 - row) * 8 + col) as u8;
+                if self.prog_global { self.prog_project.channel = ch } else { self.tracks[self.selected].channel = ch }
+            }
+        }
+        if send_now {
+            Self::send_prog(self.prog_target());
         }
         self.dirty = true;
     }
@@ -2068,6 +2222,32 @@ impl SequencerApp {
             }
             for pad in 0..16 {
                 led::set(note_pad_index(pad), 0);
+            }
+        } else if self.prog_view {
+            // Programs: rows 8-7 = channel, row 6 = banks, row 5 = output and which 32 programs, rows 1-4 = the 32
+            // programs of that group (row 1 = the first 8). The chosen ones bright (the program white).
+            let t = self.prog_target();
+            let c_on = if self.prog_global { PROG_COLOUR } else { colour };
+            for n in 0..32usize {
+                let prog = self.prog_group * 32 + n as u8;
+                let c = if prog == t.program { 0xFFFFFF } else { dim(c_on, 4) };
+                led::set(note_pad_index(n), c);
+            }
+            for col in 0..8usize {
+                let c = if col < 4 {
+                    let o = OUTPUT_COLOURS[col];
+                    if Output::ALL[col] == t.output { o } else { dim(o, 3) }
+                } else {
+                    let g = (col - 4) as u8;
+                    let has = t.program <= 127 && t.program / 32 == g;
+                    if g == self.prog_group { c_on } else if has { dim(c_on, 1) } else { 0x101010 }
+                };
+                led::set(50 + col as u8 + 1, c);
+                led::set(60 + col as u8 + 1, if t.bank == col as u8 { 0x00E0FF } else { 0x001820 });
+                for (row, base) in [(8u8, 0u8), (7, 8)] {
+                    let ch = base + col as u8;
+                    led::set(row * 10 + col as u8 + 1, if ch == t.channel { 0xFFFFFF } else { 0x101010 });
+                }
             }
         } else if self.pset_view {
             // Length on the step pads (the last step white, the playhead in full colour), step rate on the bottom row.
@@ -2238,6 +2418,9 @@ impl SequencerApp {
                     Arm::Solo { queued } => flash(0x0060FF, queued),
                     _ => 0x000830,
                 },
+                BTN_DEVICE if self.prog_view => {
+                    if self.prog_global { PROG_COLOUR } else { dim(PROG_COLOUR, 4) }
+                }
                 _ => 0,
             };
             led::set(n, c);
@@ -2277,6 +2460,9 @@ impl SequencerApp {
                 }
                 None if idx == BTN_PROBABILITY => {
                     if self.prob_view { 0x00E0FF } else { 0x002830 }
+                }
+                None if idx == BTN_PROGRAMS => {
+                    if self.prog_view { PROG_COLOUR } else { dim(PROG_COLOUR, 4) }
                 }
                 None => 0,
             };
@@ -2322,8 +2508,14 @@ impl SequencerApp {
             };
             led::set(btn, c);
         }
-        led::set(BTN_UP, 0x202020);
-        led::set(BTN_DOWN, 0x202020);
+        if self.prog_view {
+            // Programs page: ▲ / ▼ lit while there are more programs that way.
+            led::set(BTN_UP, if self.prog_group < 3 { PROG_COLOUR } else { 0x080808 });
+            led::set(BTN_DOWN, if self.prog_group > 0 { PROG_COLOUR } else { 0x080808 });
+        } else {
+            led::set(BTN_UP, 0x202020);
+            led::set(BTN_DOWN, 0x202020);
+        }
         led::set(BTN_CLEAR, if self.clear { 0xFF4040 } else { 0x200808 });
         led::set(BTN_DUPLICATE, if self.duplicate { 0xFFFFFF } else { 0x202020 });
         led::set(BTN_FIXED_LENGTH, if self.fixed_length { 0xFFFFFF } else { 0x202020 });
@@ -2366,6 +2558,7 @@ impl App for SequencerApp {
         self.patterns_down = false;
         self.prob_view = false;
         self.pset_view = false;
+        self.prog_view = false;
         self.mutate_down_us = 0;
         self.pattern_hold = None;
         self.shift = false;
@@ -2391,6 +2584,10 @@ impl App for SequencerApp {
                     self.patterns_used = true;
                 }
                 self.on_pattern_pad(p, event.pressed);
+            }
+        } else if self.prog_view && is_grid(i) {
+            if event.pressed {
+                self.on_prog_pad(i);
             }
         } else if self.pset_view && is_grid(i) {
             if event.pressed {
@@ -2437,6 +2634,9 @@ impl App for SequencerApp {
                 self.mute_solo_tap((i - 101) as usize);
             }
         } else if (101..=108).contains(&i) {
+            if event.pressed && self.prog_view {
+                self.prog_global = false;
+            }
             self.on_track_button((i - 101) as usize, event.pressed);
         } else if let (Some(step), true, true) = (self.held_step, i % 10 == 9, (1..=8).contains(&(i / 10))) {
             if event.pressed {
@@ -2472,6 +2672,11 @@ impl App for SequencerApp {
                     (true, _) => Arm::Mute { queued },
                     (false, _) => Arm::Solo { queued },
                 };
+                self.dirty = true;
+            }
+        } else if i == BTN_DEVICE && self.prog_view {
+            if event.pressed {
+                self.prog_global = true;
                 self.dirty = true;
             }
         } else if (1..=8).contains(&i) {
@@ -2512,6 +2717,7 @@ impl App for SequencerApp {
                     }
                     self.prob_view = false;
                     self.pset_view = false;
+                    self.prog_view = false;
                     self.dirty = true;
                 }
                 BTN_MUTATE => {
@@ -2533,6 +2739,7 @@ impl App for SequencerApp {
                     self.prob_sel = None;
                     if self.prob_view {
                         self.pset_view = false;
+                        self.prog_view = false;
                         self.patterns_held = false;
                         self.pattern_hold = None;
                     }
@@ -2543,6 +2750,19 @@ impl App for SequencerApp {
                     self.pset_view = !self.pset_view;
                     if self.pset_view {
                         self.prob_view = false;
+                        self.prog_view = false;
+                        self.patterns_held = false;
+                        self.pattern_hold = None;
+                    }
+                    self.dirty = true;
+                }
+                BTN_PROGRAMS if event.pressed => {
+                    // Tap: open / close the Programs page (on the selected track's slot).
+                    self.prog_view = !self.prog_view;
+                    self.prog_global = false;
+                    if self.prog_view {
+                        self.prob_view = false;
+                        self.pset_view = false;
                         self.patterns_held = false;
                         self.pattern_hold = None;
                     }
@@ -2559,6 +2779,11 @@ impl App for SequencerApp {
                 }
                 BTN_RIGHT if event.pressed => {
                     self.page = 1;
+                    self.dirty = true;
+                }
+                BTN_UP | BTN_DOWN if event.pressed && self.prog_view => {
+                    // Programs page: the next / previous 32 programs.
+                    self.prog_group = if i == BTN_UP { (self.prog_group + 1).min(3) } else { self.prog_group.saturating_sub(1) };
                     self.dirty = true;
                 }
                 BTN_UP if event.pressed => self.shift_octave(true),

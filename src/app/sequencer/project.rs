@@ -179,6 +179,9 @@ pub fn available() -> bool {
 pub const FLAG_FOLLOW_CLOCK: u8 = 0x02;
 /// Marks the per-pattern step-rate block after the patterns (version 6 records from v0.8 on).
 pub const RATES_MAGIC: [u8; 2] = *b"PR";
+/// Marks the program-change block after the rates (from v0.9): project slot (output, channel, bank, program), then
+/// bank and program per track; 0xFF = none.
+pub const PROGS_MAGIC: [u8; 2] = *b"PG";
 
 fn valid(rec: &[u8; RECORD]) -> bool {
     let body = match rec[4] {
